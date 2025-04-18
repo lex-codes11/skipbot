@@ -333,4 +333,3 @@ async def on_ready():
 if not DISCORD_TOKEN:
     raise ValueError("Missing DISCORD_TOKEN")
 bot.run(DISCORD_TOKEN)
-```
