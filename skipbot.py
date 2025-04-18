@@ -1,4 +1,3 @@
-```python
 # skipbot.py
 
 import os
