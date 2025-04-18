@@ -67,13 +67,13 @@ if not os.path.exists(PHRASES_FILE):
     save_json(PHRASES_FILE, {})
 
 def ensure_phrases_for(date_iso):
-    all_phrases = load_json(PHRASES_FILE)
-    if date_iso not in all_phrases:
-        pool = DAILY_PHRASES.copy()
-        random.shuffle(pool)
-        all_phrases[date_iso] = pool
-        save_json(PHRASES_FILE, all_phrases)
-    return all_phrases[date_iso]
+    pool = load_json(PHRASES_FILE)
+    if date_iso not in pool:
+        lst = DAILY_PHRASES.copy()
+        random.shuffle(lst)
+        pool[date_iso] = lst
+        save_json(PHRASES_FILE, pool)
+    return pool[date_iso]
 
 def load_sales():
     return load_json(SALES_FILE)
@@ -108,10 +108,10 @@ def stripe_webhook():
 
     if event['type'] == 'checkout.session.completed':
         sess = event['data']['object']
-        meta       = sess.get('metadata', {})
-        user_id    = int(meta.get('discord_id', 0))
-        location   = meta.get('location')
-        sale_date  = meta.get('sale_date')
+        meta      = sess.get('metadata', {})
+        user_id   = int(meta.get('discord_id', 0))
+        location  = meta.get('location')
+        sale_date = meta.get('sale_date')
         count = record_sale(sess['id'], user_id, location, sale_date)
         user = bot.get_user(user_id)
         if user:
@@ -146,6 +146,7 @@ class SkipButtonView(ui.View):
         counts  = get_counts()
         sale_dt = get_sale_date()
 
+        # single‑line so mobile shows date/count
         label_atl = (
             f"ATL {human_date(sale_dt)} • {counts['ATL']}/25"
             if counts['ATL'] < 25 else "ATL Sold Out"
@@ -177,9 +178,9 @@ class SkipButtonView(ui.View):
                 payment_method_types=['card'],
                 line_items=[{'price': price, 'quantity':1}],
                 mode='payment',
-                success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
-                cancel_url=CANCEL_URL,
-                metadata={
+                success_url  = SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
+                cancel_url   = CANCEL_URL,
+                metadata     = {
                     'discord_id': str(interaction.user.id),
                     'location':   location,
                     'sale_date':  sale_date_iso
@@ -215,15 +216,17 @@ async def setup_skip(interaction: Interaction):
     view = SkipButtonView()
     bot.add_view(view)
 
-    # DEFER and then follow up
+    # 1) defer once
     await interaction.response.defer(ephemeral=True)
+    # 2) post buttons publicly
     await channel.send(
         "🎟️ **Skip The Line Passes** — 25 max/night, $25 each. Choose your location & date:",
         view=view
     )
+    # 3) follow up to confirm
     await interaction.followup.send("✅ Buttons posted.", ephemeral=True)
 
-# (other slash commands unchanged…)
+# (other owner commands remain unchanged) …
 
 # ---------- STARTUP & SYNC ----------
 @bot.event
