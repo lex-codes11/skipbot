@@ -41,7 +41,6 @@ stripe.api_key = STRIPE_API_KEY
 # ---------- HELPERS ----------
 def get_sale_date():
     now = datetime.datetime.now()
-    # if before 1 AM, assign to previous calendar day
     if now.hour < 1:
         return now.date() - datetime.timedelta(days=1)
     return now.date()
@@ -50,7 +49,7 @@ def iso_date(dt):
     return dt.isoformat()
 
 def human_date(dt):
-    return dt.strftime("%A, %B %-d, %Y")  # e.g. Friday, April 18, 2025
+    return dt.strftime("%A, %B %-d, %Y")
 
 def load_json(path):
     with open(path, 'r') as f:
@@ -106,12 +105,13 @@ def stripe_webhook():
         event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
     except Exception:
         return abort(400)
+
     if event['type'] == 'checkout.session.completed':
         sess = event['data']['object']
         meta = sess.get('metadata', {})
-        user_id    = int(meta.get('discord_id', 0))
-        location   = meta.get('location')
-        sale_date  = meta.get('sale_date')
+        user_id   = int(meta.get('discord_id', 0))
+        location  = meta.get('location')
+        sale_date = meta.get('sale_date')
         count = record_sale(sess['id'], user_id, location, sale_date)
         user = bot.get_user(user_id)
         if user:
@@ -123,10 +123,10 @@ def stripe_webhook():
             )
     return '', 200
 
-def run_web(): 
+def run_web():
     app.run(host='0.0.0.0', port=8080)
 
-def keep_alive(): 
+def keep_alive():
     Thread(target=run_web, daemon=True).start()
 
 # ---------- DISCORD BOT SETUP ----------
@@ -145,15 +145,12 @@ class SkipButtonView(ui.View):
         self.clear_items()
         counts = get_counts()
         sale_dt = get_sale_date()
-        # flattened, single-line labels so mobile shows date/count too
-        label_atl = (
-            f"ATL {human_date(sale_dt)} • {counts['ATL']}/25"
-            if counts['ATL'] < 25 else "ATL Sold Out"
-        )
-        label_fl = (
-            f"FL {human_date(sale_dt)} • {counts['FL']}/25"
-            if counts['FL'] < 25 else "FL Sold Out"
-        )
+        # single-line labels so mobile shows date/count
+        label_atl = (f"ATL {human_date(sale_dt)} • {counts['ATL']}/25"
+                     if counts['ATL'] < 25 else "ATL Sold Out")
+        label_fl = (f"FL {human_date(sale_dt)} • {counts['FL']}/25"
+                     if counts['FL'] < 25 else "FL Sold Out")
+
         self.add_item(ui.Button(
             label=label_atl,
             style=discord.ButtonStyle.success if counts['ATL']<25 else discord.ButtonStyle.secondary,
@@ -176,8 +173,8 @@ class SkipButtonView(ui.View):
                 payment_method_types=['card'],
                 line_items=[{'price': price, 'quantity':1}],
                 mode='payment',
-                success_url = SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
-                cancel_url  = CANCEL_URL,
+                success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
+                cancel_url=CANCEL_URL,
                 metadata={
                     'discord_id': str(interaction.user.id),
                     'location':   location,
@@ -195,79 +192,74 @@ class SkipButtonView(ui.View):
             )
 
     @ui.button(custom_id="buy_skip_atl")
-    async def buy_atl(self, b, inter: Interaction):
-        await self._start_checkout(inter, 'ATL')
+    async def buy_atl(self, button, interaction: Interaction):
+        await self._start_checkout(interaction, 'ATL')
 
     @ui.button(custom_id="buy_skip_fl")
-    async def buy_fl(self, b, inter: Interaction):
-        await self._start_checkout(inter, 'FL')
+    async def buy_fl(self, button, interaction: Interaction):
+        await self._start_checkout(interaction, 'FL')
 
 # ---------- SLASH COMMANDS ----------
+@tree.command(name="setup_skip", description="(Owner) Post skip‑line buttons")
+async def setup_skip(interaction: Interaction):
+    if interaction.user.id != interaction.guild.owner_id:
+        return await interaction.response.send_message("⛔ Only the owner.", ephemeral=True)
 
-@tree.command(
-    name="setup_skip",
-    description="(Owner) Post skip‑line buttons"
-)
-async def setup_skip(inter: Interaction):
-    if inter.user.id != inter.guild.owner_id:
-        return await inter.response.send_message("⛔ Only the owner.", ephemeral=True)
     channel = bot.get_channel(SKIP_CHANNEL_ID)
     if not channel:
-        return await inter.response.send_message("❌ Bad SKIP_CHANNEL_ID.", ephemeral=True)
+        return await interaction.response.send_message("❌ Bad SKIP_CHANNEL_ID.", ephemeral=True)
+
     view = SkipButtonView()
     bot.add_view(view)
+
+    # ACK first, then post public buttons
+    await interaction.response.send_message("✅ Buttons posted.", ephemeral=True)
     await channel.send(
-        "🎟️ **Skip The Line Passes**\n25 max/night, $25 each. Choose your location & date:",
+        "🎟️ **Skip The Line Passes** — 25 max/night, $25 each. Choose your location & date:",
         view=view
     )
-    await inter.response.send_message("✅ Buttons posted.", ephemeral=True)
 
-@tree.command(
-    name="list_phrases",
-    description="(Owner) Show tonight’s passphrases"
-)
-async def list_phrases(inter: Interaction):
-    if inter.user.id != inter.guild.owner_id:
-        return await inter.response.send_message("⛔ Only the owner.", ephemeral=True)
+@tree.command(name="list_phrases", description="(Owner) Show tonight’s passphrases")
+async def list_phrases(interaction: Interaction):
+    if interaction.user.id != interaction.guild.owner_id:
+        return await interaction.response.send_message("⛔ Only the owner.", ephemeral=True)
+
     sale_dt = get_sale_date()
     iso = iso_date(sale_dt)
     phrases = ensure_phrases_for(iso)
     lines = [f"{i+1:2d}/25 — {p}" for i,p in enumerate(phrases)]
     text = f"**Passphrases for {human_date(sale_dt)}**\n" + "\n".join(lines)
-    await inter.response.send_message(text, ephemeral=True)
+    await interaction.response.send_message(text, ephemeral=True)
 
-@tree.command(
-    name="list_sales",
-    description="(Owner) List today's sales for a location"
-)
+@tree.command(name="list_sales", description="(Owner) List today's sales for a location")
 @app_commands.describe(location="ATL or FL")
 @app_commands.choices(location=[
     app_commands.Choice(name="ATL", value="ATL"),
     app_commands.Choice(name="FL",  value="FL")
 ])
-async def list_sales(inter: Interaction, location: str):
-    if inter.user.id != inter.guild.owner_id:
-        return await inter.response.send_message("⛔ Only the owner.", ephemeral=True)
+async def list_sales(interaction: Interaction, location: str):
+    if interaction.user.id != interaction.guild.owner_id:
+        return await interaction.response.send_message("⛔ Only the owner.", ephemeral=True)
+
     key = iso_date(get_sale_date())
     day = load_sales().get(key, {"ATL": [], "FL": []})
     entries = day.get(location, [])
     if not entries:
-        return await inter.response.send_message(
+        return await interaction.response.send_message(
             f"No sales for {location} on {human_date(get_sale_date())}.",
             ephemeral=True
         )
+
     lines = []
     for i, e in enumerate(entries, start=1):
         u = bot.get_user(e["user"])
         name = u.display_name if u else f"ID {e['user']}"
         lines.append(f"{i:2d}. {name} — session `{e['session']}`")
-    text = f"**Sales for {location} on {human_date(get_sale_date())}:**\n" + "\n".join(lines)
-    await inter.response.send_message(text, ephemeral=True)
 
-@tree.command(
-    name="remove_sale",
-    description="(Owner) Remove a sale by number"
-)
+    text = f"**Sales for {location} on {human_date(get_sale_date())}:**\n" + "\n".join(lines)
+    await interaction.response.send_message(text, ephemeral=True)
+
+@tree.command(name="remove_sale", description="(Owner) Remove a sale by number")
 @app_commands.describe(
     location="ATL or FL",
     index="Sale number from /list_sales"
@@ -276,30 +268,28 @@ async def list_sales(inter: Interaction, location: str):
     app_commands.Choice(name="ATL", value="ATL"),
     app_commands.Choice(name="FL",  value="FL")
 ])
-async def remove_sale(inter: Interaction, location: str, index: int):
-    if inter.user.id != inter.guild.owner_id:
-        return await inter.response.send_message("⛔ Only the owner.", ephemeral=True)
+async def remove_sale(interaction: Interaction, location: str, index: int):
+    if interaction.user.id != interaction.guild.owner_id:
+        return await interaction.response.send_message("⛔ Only the owner.", ephemeral=True)
+
     key = iso_date(get_sale_date())
     all_sales = load_sales()
     day = all_sales.setdefault(key, {"ATL": [], "FL": []})
     entries = day.get(location, [])
     if index < 1 or index > len(entries):
-        return await inter.response.send_message(
-            f"❌ Invalid; {location} has {len(entries)} sales.",
-            ephemeral=True
+        return await interaction.response.send_message(
+            f"❌ Invalid; {location} has {len(entries)} sales.", ephemeral=True
         )
+
     removed = entries.pop(index-1)
     save_sales(all_sales)
     u = bot.get_user(removed["user"])
     name = u.display_name if u else f"ID {removed['user']}"
-    await inter.response.send_message(
+    await interaction.response.send_message(
         f"🗑️ Removed #{index} for {location} — {name}.", ephemeral=True
     )
 
-@tree.command(
-    name="move_sale",
-    description="(Owner) Move a sale between locations"
-)
+@tree.command(name="move_sale", description="(Owner) Move a sale between locations")
 @app_commands.describe(
     from_loc="From (ATL/FL)",
     to_loc="To (ATL/FL)",
@@ -315,29 +305,30 @@ async def remove_sale(inter: Interaction, location: str, index: int):
         app_commands.Choice(name="FL",  value="FL")
     ]
 )
-async def move_sale(inter: Interaction, from_loc: str, to_loc: str, index: int):
-    if inter.user.id != inter.guild.owner_id:
-        return await inter.response.send_message("⛔ Only the owner.", ephemeral=True)
+async def move_sale(interaction: Interaction, from_loc: str, to_loc: str, index: int):
+    if interaction.user.id != interaction.guild.owner_id:
+        return await interaction.response.send_message("⛔ Only the owner.", ephemeral=True)
     if from_loc == to_loc:
-        return await inter.response.send_message(
+        return await interaction.response.send_message(
             "❌ from_loc and to_loc must differ.", ephemeral=True
         )
+
     key = iso_date(get_sale_date())
     all_sales = load_sales()
     day = all_sales.setdefault(key, {"ATL": [], "FL": []})
     src, dst = day[from_loc], day[to_loc]
     if index < 1 or index > len(src):
-        return await inter.response.send_message(
+        return await interaction.response.send_message(
             f"❌ Invalid; {from_loc} has {len(src)} sales.", ephemeral=True
         )
+
     entry = src.pop(index-1)
     dst.append(entry)
     save_sales(all_sales)
     u = bot.get_user(entry["user"])
     name = u.display_name if u else f"ID {entry['user']}"
-    await inter.response.send_message(
-        f"🔀 Moved #{index} from {from_loc} to {to_loc} for {name}.",
-        ephemeral=True
+    await interaction.response.send_message(
+        f"🔀 Moved #{index} from {from_loc} to {to_loc} for {name}.", ephemeral=True
     )
 
 # ---------- STARTUP & SYNC ----------
