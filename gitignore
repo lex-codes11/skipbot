@@ -1,0 +1,10 @@
+# Byte‑compiled / optimized files
+__pycache__/
+*.py[cod]
+
+# Environment
+.env
+*.env
+
+# Local data
+/data/
