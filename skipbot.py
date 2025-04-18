@@ -145,12 +145,13 @@ class SkipButtonView(ui.View):
         self.clear_items()
         counts = get_counts()
         sale_dt = get_sale_date()
+        # flattened, single-line labels so mobile shows date/count too
         label_atl = (
-            f"Buy ATL Skip‑Line Pass\n{human_date(sale_dt)} ({counts['ATL']}/25)"
+            f"ATL {human_date(sale_dt)} • {counts['ATL']}/25"
             if counts['ATL'] < 25 else "ATL Sold Out"
         )
         label_fl = (
-            f"Buy FL Skip‑Line Pass\n{human_date(sale_dt)} ({counts['FL']}/25)"
+            f"FL {human_date(sale_dt)} • {counts['FL']}/25"
             if counts['FL'] < 25 else "FL Sold Out"
         )
         self.add_item(ui.Button(
@@ -167,24 +168,31 @@ class SkipButtonView(ui.View):
         ))
 
     async def _start_checkout(self, interaction: Interaction, location: str):
-        sale_date_iso = iso_date(get_sale_date())
-        ensure_phrases_for(sale_date_iso)
-        price = PRICE_ID_ATL if location=='ATL' else PRICE_ID_FL
-        sess = stripe.checkout.Session.create(
-            payment_method_types=['card'],
-            line_items=[{'price': price, 'quantity':1}],
-            mode='payment',
-            success_url = SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
-            cancel_url  = CANCEL_URL,
-            metadata={
-                'discord_id': str(interaction.user.id),
-                'location':   location,
-                'sale_date':  sale_date_iso
-            }
-        )
-        await interaction.response.send_message(
-            f"💳 Complete purchase: {sess.url}", ephemeral=True
-        )
+        try:
+            sale_date_iso = iso_date(get_sale_date())
+            ensure_phrases_for(sale_date_iso)
+            price = PRICE_ID_ATL if location=='ATL' else PRICE_ID_FL
+            sess = stripe.checkout.Session.create(
+                payment_method_types=['card'],
+                line_items=[{'price': price, 'quantity':1}],
+                mode='payment',
+                success_url = SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
+                cancel_url  = CANCEL_URL,
+                metadata={
+                    'discord_id': str(interaction.user.id),
+                    'location':   location,
+                    'sale_date':  sale_date_iso
+                }
+            )
+            await interaction.response.send_message(
+                f"💳 Complete purchase: {sess.url}", ephemeral=True
+            )
+        except Exception as e:
+            print("❌ Stripe checkout failed:", e)
+            await interaction.response.send_message(
+                "⚠️ Could not start checkout. Please try again later.",
+                ephemeral=True
+            )
 
     @ui.button(custom_id="buy_skip_atl")
     async def buy_atl(self, b, inter: Interaction):
@@ -209,7 +217,7 @@ async def setup_skip(inter: Interaction):
     view = SkipButtonView()
     bot.add_view(view)
     await channel.send(
-        "🎟️ **Skip The Line Passes**\nLimited to 25 each night, $25 each. Pick your location & date:",
+        "🎟️ **Skip The Line Passes**\n25 max/night, $25 each. Choose your location & date:",
         view=view
     )
     await inter.response.send_message("✅ Buttons posted.", ephemeral=True)
