@@ -100,12 +100,23 @@ app = Flask('')
 
 @app.route('/stripe_webhook', methods=['POST'])
 def stripe_webhook():
-    payload, sig = request.get_data(), request.headers.get('Stripe-Signature','')
-    try:
-        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
-    except Exception:
-        return abort(400)
+    payload = request.get_data()
+    sig     = request.headers.get('Stripe-Signature', '')
 
+    # 1) Verify signature
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig, STRIPE_WEBHOOK_SECRET
+        )
+    except stripe.error.SignatureVerificationError as e:
+        print("❌ Webhook signature mismatch:", e)
+        return "Invalid signature", 400
+    except Exception as e:
+        print("❌ Webhook setup error:", e)
+        return "Webhook error", 400
+
+    # 2) Handle the event
+    print("✅ Received Stripe event:", event['type'])
     if event['type'] == 'checkout.session.completed':
         sess = event['data']['object']
         meta      = sess.get('metadata', {})
@@ -121,6 +132,7 @@ def stripe_webhook():
                     f"for {location} on {human_date(get_sale_date())}."
                 )
             )
+
     return '', 200
 
 def run_web():
@@ -132,7 +144,7 @@ def keep_alive():
 # ---------- DISCORD BOT SETUP ----------
 intents = discord.Intents.default()
 intents.members = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot  = commands.Bot(command_prefix='!', intents=intents)
 tree = bot.tree
 
 # ---------- BUTTON VIEW ----------
@@ -146,7 +158,6 @@ class SkipButtonView(ui.View):
         counts  = get_counts()
         sale_dt = get_sale_date()
 
-        # single‑line so mobile shows date/count
         label_atl = (
             f"ATL {human_date(sale_dt)} • {counts['ATL']}/25"
             if counts['ATL'] < 25 else "ATL Sold Out"
@@ -186,8 +197,14 @@ class SkipButtonView(ui.View):
                     'sale_date':  sale_date_iso
                 }
             )
+            link_view = ui.View(timeout=None)
+            link_view.add_item(ui.Button(
+                label=f"🛒 Pay for your {location} pass",
+                style=discord.ButtonStyle.link,
+                url=sess.url
+            ))
             await interaction.response.send_message(
-                f"💳 Complete purchase: {sess.url}", ephemeral=True
+                "💳 Click below to complete your purchase:", view=link_view, ephemeral=True
             )
         except Exception as e:
             print("❌ Stripe checkout failed:", e)
@@ -216,17 +233,12 @@ async def setup_skip(interaction: Interaction):
     view = SkipButtonView()
     bot.add_view(view)
 
-    # 1) defer once
     await interaction.response.defer(ephemeral=True)
-    # 2) post buttons publicly
     await channel.send(
-        "🎟️ **Skip The Line Passes** — 25 max/night, $25 each. Choose your location & date:",
+        "🎟️ **Skip The Line Passes** — 25 max/night, $25 each.\nChoose your location & date:",
         view=view
     )
-    # 3) follow up to confirm
     await interaction.followup.send("✅ Buttons posted.", ephemeral=True)
-
-# (other owner commands remain unchanged) …
 
 # ---------- STARTUP & SYNC ----------
 @bot.event
