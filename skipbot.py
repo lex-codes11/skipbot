@@ -18,7 +18,7 @@ from flask import Flask, request, abort
 DATA_DIR              = "data"
 SALES_FILE            = os.path.join(DATA_DIR, "skip_sales.json")
 PHRASES_FILE          = os.path.join(DATA_DIR, "skip_passphrases.json")
-LOGO_PATH             = "logo-icon-text.png"  # make sure this file is in your repo root
+LOGO_PATH             = "logo-icon-text.png"  # put your logo here
 
 DISCORD_TOKEN         = os.getenv("DISCORD_TOKEN")
 STRIPE_API_KEY        = os.getenv("STRIPE_API_KEY")
@@ -99,7 +99,6 @@ async def dm_ticket(user: discord.User, phrase: str, date_iso: str):
     embed.add_field(name="Member",       value=user.display_name,     inline=True)
     embed.add_field(name="Valid Date",   value=human_date(date_iso),  inline=True)
 
-    # send embed with logo attached
     file = File(LOGO_PATH, filename="logo-icon-text.png")
     await user.send(embed=embed, file=file)
 
@@ -115,21 +114,21 @@ def stripe_webhook():
         return abort(400)
 
     if ev["type"] == "checkout.session.completed":
-        sess    = ev["data"]["object"]
-        meta    = sess.get("metadata", {})
-        uid     = int(meta.get("discord_id", 0))
-        loc     = meta.get("location")
-        date_iso= meta.get("sale_date")
-        sid     = sess.get("id")
+        sess     = ev["data"]["object"]
+        meta     = sess.get("metadata", {})
+        uid      = int(meta.get("discord_id", 0))
+        loc      = meta.get("location")
+        date_iso = meta.get("sale_date")
+        sid      = sess.get("id")
 
         if loc and date_iso and sid:
             count   = record_sale(sid, uid, loc, date_iso)
             phrases = ensure_phrases_for(date_iso)
-            phrase  = phrases[count - 1]  # pick nth phrase
+            phrase  = phrases[count - 1]
             user    = bot.get_user(uid)
             if user:
-                # send the confirmation & ticket on the bot loop
                 loop = bot.loop
+                # confirmation DM
                 asyncio.run_coroutine_threadsafe(
                     user.send(
                         f"✅ Payment confirmed! You’re pass **#{count}/{MAX_PER_NIGHT}** "
@@ -137,6 +136,7 @@ def stripe_webhook():
                     ),
                     loop
                 )
+                # ticket DM
                 asyncio.run_coroutine_threadsafe(
                     dm_ticket(user, phrase, date_iso),
                     loop
