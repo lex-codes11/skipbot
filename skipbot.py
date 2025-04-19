@@ -41,6 +41,7 @@ stripe.api_key = STRIPE_API_KEY
 # ---------- HELPERS ----------
 def get_sale_date():
     now = datetime.datetime.now()
+    # before 1 AM counts as previous day
     if now.hour < 1:
         return now.date() - datetime.timedelta(days=1)
     return now.date()
@@ -90,7 +91,6 @@ def get_counts():
 def record_sale(session_id, discord_id, location, sale_date_iso):
     all_sales = load_sales()
     day = all_sales.setdefault(sale_date_iso, {"ATL": [], "FL": []})
-    # skip duplicates
     if session_id not in [s["session"] for s in day[location]]:
         day[location].append({"session": session_id, "user": discord_id})
         save_sales(all_sales)
@@ -108,7 +108,7 @@ def stripe_webhook():
         return abort(400)
     if event['type'] == 'checkout.session.completed':
         sess = event['data']['object']
-        meta = sess.get('metadata', {})
+        meta      = sess.get('metadata', {})
         user_id   = int(meta.get('discord_id', 0))
         location  = meta.get('location')
         sale_date = meta.get('sale_date')
@@ -169,7 +169,7 @@ class SkipButtonView(ui.View):
         ))
 
     async def _start_checkout(self, interaction: Interaction, location: str):
-        # defer to avoid “interaction failed” if Stripe is slow
+        # single defer + followup to avoid 'interaction failed'
         await interaction.response.defer(ephemeral=True)
         sale_date_iso = iso_date(get_sale_date())
         ensure_phrases_for(sale_date_iso)
@@ -202,30 +202,33 @@ class SkipButtonView(ui.View):
 # ---------- SLASH COMMANDS ----------
 @tree.command(name="setup_skip", description="(Owner) Post skip‑line buttons")
 async def setup_skip(interaction: Interaction):
-    # only owner
+    # only server owner can run
     if interaction.user.id != interaction.guild.owner_id:
         return await interaction.response.send_message("⛔ Only the owner.", ephemeral=True)
-    channel = bot.get_channel(SKIP_CHANNEL_ID)
-    if not channel:
-        return await interaction.response.send_message("❌ Bad SKIP_CHANNEL_ID.", ephemeral=True)
 
-    view = SkipButtonView()
+    # ACK immediately
+    await interaction.response.defer(ephemeral=True)
+
     # register persistent view
+    view = SkipButtonView()
     bot.add_view(view)
 
-    # ACK the slash command immediately
-    await interaction.response.send_message("✅ Buttons posted.", ephemeral=True)
-    # then post the actual buttons in the channel
+    # post button embed to channel
+    channel = bot.get_channel(SKIP_CHANNEL_ID)
+    if channel is None:
+        return await interaction.followup.send("❌ Bad SKIP_CHANNEL_ID.", ephemeral=True)
+
     await channel.send(
-        "🎟️ **Skip The Line Passes**\nLimited to 25 each night, $25 each. Pick your location & date:",
+        "🎟️ **Skip The Line Passes**\n"
+        "Limited to 25 each night, $25 each. Pick your location & date:",
         view=view
     )
 
+    # final confirmation
+    await interaction.followup.send("✅ Buttons posted.", ephemeral=True)
 
-@tree.command(
-    name="list_phrases",
-    description="(Owner) Show tonight’s passphrases"
-)
+
+@tree.command(name="list_phrases", description="(Owner) Show tonight’s passphrases")
 async def list_phrases(interaction: Interaction):
     if interaction.user.id != interaction.guild.owner_id:
         return await interaction.response.send_message("⛔ Only the owner.", ephemeral=True)
@@ -237,10 +240,7 @@ async def list_phrases(interaction: Interaction):
     await interaction.response.send_message(text, ephemeral=True)
 
 
-@tree.command(
-    name="list_sales",
-    description="(Owner) List today's sales for a location"
-)
+@tree.command(name="list_sales", description="(Owner) List today's sales for a location")
 @app_commands.describe(location="ATL or FL")
 @app_commands.choices(location=[
     app_commands.Choice(name="ATL", value="ATL"),
@@ -266,10 +266,7 @@ async def list_sales(interaction: Interaction, location: str):
     await interaction.response.send_message(text, ephemeral=True)
 
 
-@tree.command(
-    name="remove_sale",
-    description="(Owner) Remove a sale by number"
-)
+@tree.command(name="remove_sale", description="(Owner) Remove a sale by number")
 @app_commands.describe(
     location="ATL or FL",
     index="Sale number from /list_sales"
@@ -287,8 +284,7 @@ async def remove_sale(interaction: Interaction, location: str, index: int):
     entries = day.get(location, [])
     if index < 1 or index > len(entries):
         return await interaction.response.send_message(
-            f"❌ Invalid; {location} has {len(entries)} sales.",
-            ephemeral=True
+            f"❌ Invalid; {location} has {len(entries)} sales.", ephemeral=True
         )
     removed = entries.pop(index-1)
     save_sales(all_sales)
@@ -299,10 +295,7 @@ async def remove_sale(interaction: Interaction, location: str, index: int):
     )
 
 
-@tree.command(
-    name="move_sale",
-    description="(Owner) Move a sale between locations"
-)
+@tree.command(name="move_sale", description="(Owner) Move a sale between locations")
 @app_commands.describe(
     from_loc="From (ATL/FL)",
     to_loc="To (ATL/FL)",
@@ -318,12 +311,7 @@ async def remove_sale(interaction: Interaction, location: str, index: int):
         app_commands.Choice(name="FL",  value="FL")
     ]
 )
-async def move_sale(
-    interaction: Interaction,
-    from_loc: str,
-    to_loc: str,
-    index: int
-):
+async def move_sale(interaction: Interaction, from_loc: str, to_loc: str, index: int):
     if interaction.user.id != interaction.guild.owner_id:
         return await interaction.response.send_message("⛔ Only the owner.", ephemeral=True)
     if from_loc == to_loc:
@@ -344,18 +332,18 @@ async def move_sale(
     u = bot.get_user(entry["user"])
     name = u.display_name if u else f"ID {entry['user']}"
     await interaction.response.send_message(
-        f"🔀 Moved #{index} from {from_loc} to {to_loc} for {name}.",
-        ephemeral=True
+        f"🔀 Moved #{index} from {from_loc} to {to_loc} for {name}.", ephemeral=True
     )
+
 
 # ---------- STARTUP & SYNC ----------
 @bot.event
 async def on_ready():
     keep_alive()
-    # re‑register persistent view at startup
-    bot.add_view(SkipButtonView())
+    bot.add_view(SkipButtonView())  # re‑register persistent view
     await tree.sync()
     print(f"✅ SkipBot online as {bot.user}")
+
 
 # ---------- RUN ----------
 if not DISCORD_TOKEN:
