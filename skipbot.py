@@ -46,7 +46,7 @@ def iso_date(dt: datetime.date) -> str:
     return dt.isoformat()
 
 def human_date(dt: datetime.date) -> str:
-    return dt.strftime("%b %-d, %Y")  # e.g. Apr 18, 2025
+    return dt.strftime("%b %-d, %Y")
 
 def load_json(path):
     with open(path, "r") as f:
@@ -126,22 +126,24 @@ tree = bot.tree
 class URLView(ui.View):
     def __init__(self, url: str):
         super().__init__(timeout=None)
-        # URL‐style button never needs to be “handled” by us
         self.add_item(ui.Button(label="🔗 Complete Purchase", style=discord.ButtonStyle.link, url=url))
 
 # ---------- BUY PASS COMMAND ----------
 @tree.command(name="buy_pass", description="Purchase a Skip‑Line Pass")
-@app_commands.describe(location="Which location to buy for")
+@app_commands.describe(location="ATL or FL")
 @app_commands.choices(location=[
     app_commands.Choice(name="ATL", value="ATL"),
     app_commands.Choice(name="FL", value="FL")
 ])
 async def buy_pass(interaction: Interaction, location: str):
-    # create your session
+    # 1) defer immediately (gives you 15 min to follow up)
+    await interaction.response.defer(ephemeral=True)
+
+    # 2) build your Stripe session
     iso = iso_date(get_sale_date())
     ensure_phrases_for(iso)
-
     price = PRICE_ID_ATL if location == "ATL" else PRICE_ID_FL
+
     sess = stripe.checkout.Session.create(
         payment_method_types=["card"],
         line_items=[{"price": price, "quantity": 1}],
@@ -155,9 +157,13 @@ async def buy_pass(interaction: Interaction, location: str):
         }
     )
 
-    # reply with a **URL button**—no more “interaction failed”
+    # 3) follow up with your URL button
     view = URLView(sess.url)
-    await interaction.response.send_message(f"💳 Click below to complete your purchase for **{location}** on **{human_date(get_sale_date())}**:", view=view, ephemeral=True)
+    await interaction.followup.send(
+        f"💳 Purchase your **{location}** pass for **{human_date(get_sale_date())}**:",
+        view=view,
+        ephemeral=True
+    )
 
 # ---------- STARTUP & SYNC ----------
 @bot.event
