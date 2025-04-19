@@ -126,6 +126,9 @@ def keep_alive():
 # ---------- DISCORD SETUP ----------
 intents = discord.Intents.default()
 intents.members = True
+# **Enable message content so prefix commands work**
+intents.message_content = True
+
 bot    = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------- URL BUTTON VIEW ----------
@@ -141,7 +144,6 @@ class URLView(ui.View):
 # ---------- PREFIX COMMANDS ----------
 @bot.command(name="ATL")
 async def buy_atl(ctx: commands.Context):
-    """Purchase an ATL Skip‑Line Pass"""
     loc    = "ATL"
     counts = get_counts()
     left   = 25 - counts[loc]
@@ -169,7 +171,6 @@ async def buy_atl(ctx: commands.Context):
         }
     )
 
-    # DM the user
     view = URLView(sess.url)
     try:
         await ctx.author.send(
@@ -182,7 +183,6 @@ async def buy_atl(ctx: commands.Context):
 
 @bot.command(name="FL")
 async def buy_fl(ctx: commands.Context):
-    """Purchase an FL Skip‑Line Pass"""
     loc    = "FL"
     counts = get_counts()
     left   = 25 - counts[loc]
@@ -224,7 +224,7 @@ async def buy_fl(ctx: commands.Context):
 @bot.event
 async def on_ready():
     keep_alive()
-    print(f"✅ SkipBot running as {bot.user}")
+    print(f"✅ SkipBot up as {bot.user} — prefix commands READY (type !ATL or !FL)")
 
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN")
