@@ -1,17 +1,17 @@
 # skipbot.py
 
 import os, json, datetime, random, asyncio
-from threading    import Thread
-from zoneinfo     import ZoneInfo
+from threading import Thread
+from zoneinfo import ZoneInfo
 
 import stripe
 import discord
-from discord       import app_commands, Interaction
-from discord.ext   import commands
-from flask         import Flask, request, abort, render_template_string
+from discord import app_commands, Interaction
+from discord.ext import commands
+from flask import Flask, request, abort
 
 # ---------- CONFIG ----------
-DATA_DIR              = "data"
+DATA_DIR              = os.getenv("DATA_DIR", "data")
 SALES_FILE            = os.path.join(DATA_DIR, "skip_sales.json")
 PHRASES_FILE          = os.path.join(DATA_DIR, "skip_passphrases.json")
 
@@ -20,7 +20,7 @@ STRIPE_API_KEY        = os.getenv("STRIPE_API_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 PRICE_ID_ATL          = os.getenv("PRICE_ID_ATL")
 PRICE_ID_FL           = os.getenv("PRICE_ID_FL")
-SUCCESS_URL           = os.getenv("SUCCESS_URL")  # e.g. https://trapezeclubs.com/success
+SUCCESS_URL           = os.getenv("SUCCESS_URL")
 CANCEL_URL            = os.getenv("CANCEL_URL")
 
 MAX_PER_NIGHT         = 25
@@ -29,31 +29,41 @@ stripe.api_key = STRIPE_API_KEY
 
 # ---------- HELPERS & STORAGE ----------
 def get_sale_date() -> str:
+    """ISO date, attributing early‑morning sales to prior calendar day."""
     now = datetime.datetime.now(ZoneInfo("America/New_York"))
     if now.hour < 1:
         now -= datetime.timedelta(days=1)
     return now.date().isoformat()
 
 def human_date(date_iso: str) -> str:
-    dt = datetime.date.fromisoformat(date_iso)
-    return dt.strftime("%A, %B %-d, %Y")
+    return datetime.date.fromisoformat(date_iso).strftime("%A, %B %-d, %Y")
+
+def ensure_data_dir():
+    os.makedirs(DATA_DIR, exist_ok=True)
 
 def load_json(path: str) -> dict:
-    os.makedirs(DATA_DIR, exist_ok=True)
+    ensure_data_dir()
     if not os.path.exists(path):
         return {}
     with open(path, "r") as f:
         return json.load(f)
 
 def save_json(path: str, data: dict):
-    os.makedirs(DATA_DIR, exist_ok=True)
+    ensure_data_dir()
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
 
 def ensure_phrases_for(date_iso: str) -> list[str]:
     data = load_json(PHRASES_FILE)
     if date_iso not in data:
-        pool = DAILY_PHRASES.copy()
+        pool = [
+            "Pineapples","Kinkster","Certified Freak","Hot Wife","Stag Night",
+            "Velvet Vixen","Playroom Pro","Voyeur Vision","After Dark",
+            "Bare Temptation","Swing Set","Sultry Eyes","Naughty List",
+            "Dom Curious","Unicorn Dust","Cherry Popper","Dirty Martini",
+            "Lust Lounge","Midnight Tease","Fantasy Fuel","Room 69","Wet Bar",
+            "No Limits","Satin Sheets","Wild Card"
+        ]
         random.shuffle(pool)
         data[date_iso] = pool
         save_json(PHRASES_FILE, data)
@@ -65,198 +75,136 @@ def load_sales() -> dict:
 def save_sales(data: dict):
     save_json(SALES_FILE, data)
 
-def record_sale(sess_id: str, discord_id: int, location: str, date_iso: str) -> int:
+def record_sale(session_id: str, discord_id: int, location: str, date_iso: str, 
+                position: int = None) -> int:
     sales = load_sales()
-    day   = sales.setdefault(date_iso, {"ATL": [], "FL": []})
-    if sess_id not in [s["session"] for s in day[location]]:
-        day[location].append({"session": sess_id, "user": discord_id})
-        save_sales(sales)
+    day = sales.setdefault(date_iso, {"ATL": [], "FL": []})
+    # remove any existing same session
+    day[location] = [s for s in day[location] if s["session"] != session_id]
+    entry = {"session": session_id, "user": discord_id}
+    if position is None or position > len(day[location]):
+        day[location].append(entry)
+    else:
+        day[location].insert(position-1, entry)
+    save_sales(sales)
     return len(day[location])
 
 def get_count(location: str) -> int:
     return len(load_sales().get(get_sale_date(), {}).get(location, []))
 
-# ---------- FLASK APP & WEBHOOK ----------
+# ---------- FLASK / STRIPE WEBHOOK ----------
 app = Flask(__name__)
 
-# 1) Stripe webhook to record sale + DM ticket
 @app.route("/stripe_webhook", methods=["POST"])
 def stripe_webhook():
-    payload, sig = request.get_data(), request.headers.get("Stripe-Signature", "")
+    payload, sig = request.get_data(), request.headers.get("Stripe-Signature","")
     try:
         ev = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
     except Exception:
         return abort(400)
     if ev["type"] == "checkout.session.completed":
-        sess    = ev["data"]["object"]
-        meta    = sess.get("metadata", {})
+        sess = ev["data"]["object"]
+        meta = sess.get("metadata", {})
         uid     = int(meta.get("discord_id", 0))
         loc     = meta.get("location")
         date_iso= meta.get("sale_date")
         sid     = sess.get("id")
         if loc and date_iso and sid:
             cnt = record_sale(sid, uid, loc, date_iso)
-            # pick the nth phrase
-            phrase = ensure_phrases_for(date_iso)[cnt-1]
-            # DM on bot loop
-            coro = handle_ticket(uid, loc, date_iso, cnt, phrase, sid, sess)
-            asyncio.run_coroutine_threadsafe(coro, bot.loop)
     return "", 200
 
-# 2) Success page: shows ticket in browser
-SUCCESS_TEMPLATE = """
-<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>Your Skip‑Line Pass</title>
-  <style>
-    body { font-family:sans-serif; background:#f7f7f7; padding:2em; }
-    .ticket { background:#fff; border:2px solid #e91e63;
-              border-radius:8px; padding:2em; display:inline-block; }
-    h1 { margin-top:0;color:#e91e63; }
-    .field { font-weight:bold; width:120px; display:inline-block; }
-  </style>
-</head>
-<body>
-  <div class="ticket">
-    <h1>🎟 Skip The Line Pass</h1>
-    <p><span class="field">Passphrase:</span> <strong>{{ phrase }}</strong></p>
-    <p><span class="field">Ticket #:</span> {{ count }}/{{ max_night }}</p>
-    <p><span class="field">Member:</span> {{ member }}</p>
-    <p><span class="field">Valid Date:</span> {{ human_date }}</p>
-    <p><span class="field">Confirmation #:</span> {{ session_id }}</p>
-    <p><span class="field">Email:</span> {{ email or "—" }}</p>
-  </div>
-</body>
-</html>
-"""
+def run_web():
+    app.run(host="0.0.0.0", port=8080)
 
-@app.route("/success")
-def success_page():
-    session_id = request.args.get("session_id")
-    if not session_id: abort(400, "Missing session_id")
-    # retrieve & expand customer email
-    try:
-        sess = stripe.checkout.Session.retrieve(
-            session_id, expand=["customer_details"]
-        )
-    except:
-        abort(400, "Invalid session_id")
-    meta     = sess.metadata or {}
-    date_iso = meta.get("sale_date"); loc = meta.get("location")
-    if not (date_iso and loc): abort(400, "Incomplete metadata")
-    # find index
-    entries = load_sales().get(date_iso, {}).get(loc, [])
-    for i,e in enumerate(entries, start=1):
-        if e["session"] == session_id:
-            count = i
-            break
+def keep_alive():
+    Thread(target=run_web, daemon=True).start()
+
+# ---------- DISCORD SETUP ----------
+intents = discord.Intents.default()
+intents.members = True
+bot  = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
+
+# ---------- OWNER COMMANDS ----------
+def is_owner(inter: Interaction) -> bool:
+    return inter.user.id == inter.guild.owner_id
+
+@app_commands.command(name="export_sales", description="(Owner) Export sales & passphrases")
+@app_commands.describe(date="YYYY-MM-DD, defaults to today")
+async def export_sales(inter: Interaction, date: str = None):
+    if not is_owner(inter):
+        return await inter.response.send_message("⛔ Only the owner.", ephemeral=True)
+    date_iso = date or get_sale_date()
+    sales    = load_sales().get(date_iso, {"ATL": [], "FL": []})
+    phrases  = ensure_phrases_for(date_iso)
+    lines = [f"**{human_date(date_iso)}**"]
+    for loc in ("ATL","FL"):
+        lines.append(f"— {loc}:")
+        for i, entry in enumerate(sales.get(loc, []), start=1):
+            user = await bot.fetch_user(entry["user"])
+            name = user.display_name if user else str(entry["user"])
+            phrase = phrases[i-1] if i-1 < len(phrases) else "(?)"
+            lines.append(f"  {i:2d}. {name} — `{phrase}`")
+        if not sales.get(loc):
+            lines.append("   • (none)")
+    text = "\n".join(lines)
+    # split if >2000 chars
+    chunks = [text[i:i+1900] for i in range(0, len(text), 1900)]
+    await inter.response.send_message("Here’s the export:", ephemeral=True)
+    for c in chunks:
+        await inter.followup.send(c)
+
+@app_commands.command(name="add_sale", description="(Owner) Manually add a sale")
+@app_commands.describe(location="ATL or FL", member="Who to add", position="1‑based slot to insert at")
+async def add_sale(inter: Interaction, location: app_commands.Transform[str, lambda x: x.upper()], 
+                   member: discord.Member, position: int = None):
+    if not is_owner(inter):
+        return await inter.response.send_message("⛔ Only the owner.", ephemeral=True)
+    date_iso = get_sale_date()
+    # fake session_id so it sorts at top or bottom
+    sid = f"manual-{member.id}-{int(datetime.datetime.now().timestamp())}"
+    cnt = record_sale(sid, member.id, location, date_iso, position)
+    await inter.response.send_message(f"✅ Added {member.display_name} to {location} as #{cnt}.", ephemeral=True)
+
+@app_commands.command(name="remove_sale", description="(Owner) Remove a sale by number")
+@app_commands.describe(location="ATL or FL", index="Sale number from export")
+async def remove_sale(inter: Interaction, location: app_commands.Transform[str, lambda x: x.upper()], index: int):
+    if not is_owner(inter):
+        return await inter.response.send_message("⛔ Only the owner.", ephemeral=True)
+    date_iso = get_sale_date()
+    sales    = load_sales()
+    day      = sales.get(date_iso, {"ATL": [], "FL": []})
+    entries  = day.get(location, [])
+    if 1 <= index <= len(entries):
+        removed = entries.pop(index-1)
+        save_sales(sales)
+        user = await bot.fetch_user(removed["user"])
+        await inter.response.send_message(f"🗑️ Removed {user.display_name if user else removed['user']} from {location}.", ephemeral=True)
     else:
-        abort(404, "Sale not recorded")
-    # phrase & member & email
-    phrase = ensure_phrases_for(date_iso)[count-1]
-    user   = bot.get_user(int(meta.get("discord_id",0)))
-    member = user.display_name if user else "Unknown"
-    email  = sess.customer_details.email if sess.customer_details else None
+        await inter.response.send_message("❌ Invalid index.", ephemeral=True)
 
-    return render_template_string(
-      SUCCESS_TEMPLATE,
-      phrase=phrase,
-      count=count,
-      max_night=MAX_PER_NIGHT,
-      member=member,
-      human_date=human_date(date_iso),
-      session_id=session_id,
-      email=email
-    )
-
-def run_web():    app.run(host="0.0.0.0", port=8080)
-def keep_alive(): Thread(target=run_web, daemon=True).start()
-
-# ---------- DISCORD BOT & TICKET DM ----------
-intents = discord.Intents.default(); intents.members = True
-bot     = commands.Bot(command_prefix="!", intents=intents)
-tree    = bot.tree
-
-DAILY_PHRASES = [
-  "Pineapples","Kinkster","Certified Freak","Hot Wife","Stag Night",
-  "Velvet Vixen","Playroom Pro","Voyeur Vision","After Dark","Bare Temptation",
-  "Swing Set","Sultry Eyes","Naughty List","Dom Curious","Unicorn Dust",
-  "Cherry Popper","Dirty Martini","Lust Lounge","Midnight Tease","Fantasy Fuel",
-  "Room 69","Wet Bar","No Limits","Satin Sheets","Wild Card"
-]
-
-async def handle_ticket(
-    uid: int, loc: str, date_iso: str, count: int,
-    phrase: str, session_id: str, sess_obj
-):
-    human = human_date(date_iso)
-    user  = await bot.fetch_user(uid)
-    # 1) Confirmation DM
-    await user.send(
-      f"✅ Payment confirmed! You’re pass **#{count}/{MAX_PER_NIGHT}** "
-      f"for **{loc}** on **{human}**."
-    )
-    # 2) Ticket DM
-    ticket = (
-      "🎟 **Skip The Line Pass**\n"
-      f"Passphrase: **{phrase}**\n"
-      f"Member: {user.display_name}\n"
-      f"Valid Date: {human}\n"
-      f"Confirmation #: {session_id}\n"
-      f"Email: {sess_obj.customer_details.email or '—'}"
-    )
-    await user.send(ticket)
-
-# ---------- PURCHASE COMMANDS ----------
-@tree.command(name="atl", description="Purchase an ATL pass")
-async def atl(inter: Interaction):
-    date_iso = get_sale_date(); human = human_date(date_iso)
-    sold = get_count("ATL"); left = MAX_PER_NIGHT - sold
-    if left<=0:
-      return await inter.response.send_message(
-        f"❌ ATL sold out ({sold}/{MAX_PER_NIGHT}).", ephemeral=True
-      )
-    sess = stripe.checkout.Session.create(
-      payment_method_types=["card"],
-      line_items=[{"price":PRICE_ID_ATL,"quantity":1}],
-      mode="payment",
-      success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
-      cancel_url=CANCEL_URL,
-      metadata={
-        "discord_id": str(inter.user.id),
-        "location":   "ATL",
-        "sale_date":  date_iso
-      }
-    )
-    await inter.response.send_message(
-      f"💳 {left} left for ATL on **{human}** – complete purchase: {sess.url}",
-      ephemeral=True
-    )
-
-@tree.command(name="fl", description="Purchase an FL pass")
-async def fl(inter: Interaction):
-    date_iso = get_sale_date(); human = human_date(date_iso)
-    sold = get_count("FL"); left = MAX_PER_NIGHT - sold
-    if left<=0:
-      return await inter.response.send_message(
-        f"❌ FL sold out ({sold}/{MAX_PER_NIGHT}).", ephemeral=True
-      )
-    sess = stripe.checkout.Session.create(
-      payment_method_types=["card"],
-      line_items=[{"price":PRICE_ID_FL,"quantity":1}],
-      mode="payment",
-      success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
-      cancel_url=CANCEL_URL,
-      metadata={
-        "discord_id": str(inter.user.id),
-        "location":   "FL",
-        "sale_date":  date_iso
-      }
-    )
-    await inter.response.send_message(
-      f"💳 {left} left for FL on **{human}** – complete purchase: {sess.url}",
-      ephemeral=True
-    )
+@app_commands.command(name="move_sale", description="(Owner) Move a sale between ATL/FL")
+@app_commands.describe(from_loc="ATL or FL", to_loc="ATL or FL", index="Sale number to move")
+async def move_sale(inter: Interaction,
+                    from_loc: app_commands.Transform[str, lambda x: x.upper()],
+                    to_loc:   app_commands.Transform[str, lambda x: x.upper()],
+                    index:    int):
+    if not is_owner(inter):
+        return await inter.response.send_message("⛔ Only the owner.", ephemeral=True)
+    if from_loc == to_loc:
+        return await inter.response.send_message("❌ from_loc and to_loc must differ.", ephemeral=True)
+    date_iso = get_sale_date()
+    sales    = load_sales()
+    day      = sales.get(date_iso, {"ATL": [], "FL": []})
+    src, dst = day[from_loc], day[to_loc]
+    if 1 <= index <= len(src):
+        entry = src.pop(index-1)
+        dst.append(entry)
+        save_sales(sales)
+        user = await bot.fetch_user(entry["user"])
+        await inter.response.send_message(f"🔀 Moved {user.display_name if user else entry['user']} to {to_loc}.", ephemeral=True)
+    else:
+        await inter.response.send_message("❌ Invalid index.", ephemeral=True)
 
 # ---------- STARTUP & SYNC ----------
 @bot.event
@@ -265,6 +213,7 @@ async def on_ready():
     await tree.sync()
     print(f"✅ SkipBot online as {bot.user}")
 
+# ---------- RUN ----------
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN")
 bot.run(DISCORD_TOKEN)
