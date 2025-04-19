@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 import stripe
 import discord
-from discord import app_commands, Interaction, File, Embed, Color
+from discord import app_commands, Interaction
 from discord.ext import commands
 from flask import Flask, request, abort
 
@@ -14,7 +14,6 @@ from flask import Flask, request, abort
 DATA_DIR              = "data"
 SALES_FILE            = os.path.join(DATA_DIR, "skip_sales.json")
 PHRASES_FILE          = os.path.join(DATA_DIR, "skip_passphrases.json")
-LOGO_PATH             = "logo-icon-text.png"
 
 DISCORD_TOKEN         = os.getenv("DISCORD_TOKEN")
 STRIPE_API_KEY        = os.getenv("STRIPE_API_KEY")
@@ -28,7 +27,7 @@ MAX_PER_NIGHT         = 25
 
 stripe.api_key = STRIPE_API_KEY
 
-# ---------- HELPERS & STORAGE ----------
+# ---------- HELPERS ----------
 def get_sale_date() -> str:
     now = datetime.datetime.now(ZoneInfo("America/New_York"))
     if now.hour < 1:
@@ -36,23 +35,14 @@ def get_sale_date() -> str:
     return now.date().isoformat()
 
 def human_date(date_iso: str) -> str:
-    dt = datetime.date.fromisoformat(date_iso)
-    return dt.strftime("%A, %B %-d, %Y")
+    return datetime.date.fromisoformat(date_iso).strftime("%A, %B %-d, %Y")
 
-def load_json(path: str) -> dict:
+def ensure_phrases_for(date_iso: str) -> list:
     os.makedirs(DATA_DIR, exist_ok=True)
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r") as f:
-        return json.load(f)
-
-def save_json(path: str, data: dict):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-
-def ensure_phrases_for(date_iso: str) -> list[str]:
-    data = load_json(PHRASES_FILE)
+    data = {}
+    if os.path.exists(PHRASES_FILE):
+        with open(PHRASES_FILE, "r") as f:
+            data = json.load(f)
     if date_iso not in data:
         pool = [
             "Pineapples","Kinkster","Certified Freak","Hot Wife","Stag Night",
@@ -64,85 +54,82 @@ def ensure_phrases_for(date_iso: str) -> list[str]:
         ]
         random.shuffle(pool)
         data[date_iso] = pool
-        save_json(PHRASES_FILE, data)
+        with open(PHRASES_FILE, "w") as f:
+            json.dump(data, f, indent=2)
     return data[date_iso]
 
 def load_sales() -> dict:
-    return load_json(SALES_FILE)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if os.path.exists(SALES_FILE):
+        with open(SALES_FILE, "r") as f:
+            return json.load(f)
+    return {}
 
-def save_sales(data: dict):
-    save_json(SALES_FILE, data)
+def save_sales(all_sales: dict):
+    with open(SALES_FILE, "w") as f:
+        json.dump(all_sales, f, indent=2)
 
 def record_sale(session_id: str, discord_id: int, location: str, date_iso: str) -> int:
-    all_sales = load_sales()
-    day = all_sales.setdefault(date_iso, {"ATL": [], "FL": []})
+    sales = load_sales()
+    day = sales.setdefault(date_iso, {"ATL": [], "FL": []})
     if session_id not in [s["session"] for s in day[location]]:
         day[location].append({"session": session_id, "user": discord_id})
-        save_sales(all_sales)
+        save_sales(sales)
     return len(day[location])
 
 def get_count(location: str) -> int:
     return len(load_sales().get(get_sale_date(), {}).get(location, []))
 
-# ---------- TICKET EMBED & DM ----------
-async def dm_ticket(user: discord.User, phrase: str, date_iso: str):
-    embed = Embed(
-        title="🎟 Skip The Line Pass",
-        color=Color.pink()
+# ---------- DISCORD SETUP ----------
+intents = discord.Intents.default()
+intents.members = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
+
+# ---------- TICKET SENDER ----------
+async def handle_ticket(uid: int, location: str, date_iso: str, count: int):
+    user = await bot.fetch_user(uid)
+    human = human_date(date_iso)
+    phrases = ensure_phrases_for(date_iso)
+    phrase = phrases[count - 1]
+    # 1) confirmation
+    await user.send(
+        f"✅ Payment confirmed! You’re pass **#{count}/{MAX_PER_NIGHT}** for **{location}** on **{human}**."
     )
-    embed.set_thumbnail(url="attachment://logo-icon-text.png")
-    embed.add_field(name="Passphrase",   value=phrase,                 inline=False)
-    embed.add_field(name="Member",       value=user.display_name,     inline=True)
-    embed.add_field(name="Valid Date",   value=human_date(date_iso),  inline=True)
+    # 2) the “ticket”
+    ticket = (
+        f"🎟 **Skip The Line Pass**\n"
+        f"Passphrase: **{phrase}**\n"
+        f"Member: {user.display_name}\n"
+        f"Valid Date: {human}"
+    )
+    await user.send(ticket)
 
-    file = File(LOGO_PATH, filename="logo-icon-text.png")
-    await user.send(embed=embed, file=file)
-
-# ---------- FLASK WEBHOOK ----------
+# ---------- FLASK / STRIPE WEBHOOK ----------
 app = Flask(__name__)
 
 @app.route("/stripe_webhook", methods=["POST"])
 def stripe_webhook():
     payload, sig = request.get_data(), request.headers.get("Stripe-Signature", "")
     try:
-        ev = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
-    except Exception as e:
-        print("⚠️ Webhook signature failed:", e)
+        evt = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except Exception:
         return abort(400)
 
-    if ev["type"] == "checkout.session.completed":
-        print("🔔 Received checkout.session.completed")
-        sess     = ev["data"]["object"]
-        meta     = sess.get("metadata", {})
-        uid      = int(meta.get("discord_id", 0))
-        loc      = meta.get("location")
+    if evt["type"] == "checkout.session.completed":
+        sess = evt["data"]["object"]
+        meta = sess.get("metadata", {})
+        uid = int(meta.get("discord_id", 0))
+        loc = meta.get("location")
         date_iso = meta.get("sale_date")
-        sid      = sess.get("id")
-
+        sid = sess.get("id")
         if loc and date_iso and sid:
-            count   = record_sale(sid, uid, loc, date_iso)
-            phrases = ensure_phrases_for(date_iso)
-            phrase  = phrases[count - 1]
-            user    = bot.get_user(uid)
-            if user:
-                loop = bot.loop
-                print(f"→ Scheduling DM to {uid}: pass #{count} phrase {phrase}")
-                # confirmation DM
-                asyncio.run_coroutine_threadsafe(
-                    user.send(
-                        f"✅ Payment confirmed! You’re pass **#{count}/{MAX_PER_NIGHT}** "
-                        f"for **{loc}** on **{human_date(date_iso)}**."
-                    ),
-                    loop
-                )
-                # ticket embed DM
-                def _send_ticket():
-                    try:
-                        return dm_ticket(user, phrase, date_iso)
-                    except Exception as e:
-                        print("❌ dm_ticket error:", e)
-                asyncio.run_coroutine_threadsafe(_send_ticket(), loop)
-
+            count = record_sale(sid, uid, loc, date_iso)
+            # schedule the DM on the bot's loop
+            asyncio.run_coroutine_threadsafe(
+                handle_ticket(uid, loc, date_iso, count),
+                bot.loop
+            )
     return "", 200
 
 def run_web():
@@ -151,16 +138,11 @@ def run_web():
 def keep_alive():
     Thread(target=run_web, daemon=True).start()
 
-# ---------- DISCORD BOT SETUP ----------
-intents = discord.Intents.default()
-intents.members = True
-
-bot  = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
-
 # ---------- SLASH COMMANDS ----------
 @tree.command(name="atl", description="Purchase an ATL Skip‑Line pass")
 async def atl(inter: Interaction):
+    date_iso = get_sale_date()
+    human = human_date(date_iso)
     sold = get_count("ATL")
     left = MAX_PER_NIGHT - sold
     if left <= 0:
@@ -168,7 +150,6 @@ async def atl(inter: Interaction):
             f"❌ ATL is sold out ({sold}/{MAX_PER_NIGHT}).", ephemeral=True
         )
 
-    date_iso = get_sale_date()
     sess = stripe.checkout.Session.create(
         payment_method_types=["card"],
         line_items=[{"price": PRICE_ID_ATL, "quantity": 1}],
@@ -183,12 +164,14 @@ async def atl(inter: Interaction):
     )
 
     await inter.response.send_message(
-        f"💳 **{left}** left for ATL tonight – complete purchase: {sess.url}",
+        f"💳 {left} left for ATL on **{human}** — complete purchase: {sess.url}",
         ephemeral=True
     )
 
 @tree.command(name="fl", description="Purchase an FL Skip‑Line pass")
 async def fl(inter: Interaction):
+    date_iso = get_sale_date()
+    human = human_date(date_iso)
     sold = get_count("FL")
     left = MAX_PER_NIGHT - sold
     if left <= 0:
@@ -196,7 +179,6 @@ async def fl(inter: Interaction):
             f"❌ FL is sold out ({sold}/{MAX_PER_NIGHT}).", ephemeral=True
         )
 
-    date_iso = get_sale_date()
     sess = stripe.checkout.Session.create(
         payment_method_types=["card"],
         line_items=[{"price": PRICE_ID_FL, "quantity": 1}],
@@ -211,7 +193,7 @@ async def fl(inter: Interaction):
     )
 
     await inter.response.send_message(
-        f"💳 **{left}** left for FL tonight – complete purchase: {sess.url}",
+        f"💳 {left} left for FL on **{human}** — complete purchase: {sess.url}",
         ephemeral=True
     )
 
@@ -219,10 +201,11 @@ async def fl(inter: Interaction):
 @bot.event
 async def on_ready():
     keep_alive()
-    print("✅ Logged in as", bot.user)
     await tree.sync()
+    print(f"✅ SkipBot online as {bot.user}")
 
 # ---------- RUN ----------
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN")
 bot.run(DISCORD_TOKEN)
+
