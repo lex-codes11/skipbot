@@ -29,12 +29,12 @@ CANCEL_URL            = os.getenv('CANCEL_URL')
 SKIP_CHANNEL_ID       = int(os.getenv('SKIP_CHANNEL_ID', '0'))
 
 DAILY_PHRASES = [
-    "Pineapples", "Kinkster", "Certified Freak", "Hot Wife", "Stag Night",
-    "Velvet Vixen", "Playroom Pro", "Voyeur Vision", "After Dark",
-    "Bare Temptation", "Swing Set", "Sultry Eyes", "Naughty List",
-    "Dom Curious", "Unicorn Dust", "Cherry Popper", "Dirty Martini",
-    "Lust Lounge", "Midnight Tease", "Fantasy Fuel", "Room 69", "Wet Bar",
-    "No Limits", "Satin Sheets", "Wild Card"
+    "Pineapples","Kinkster","Certified Freak","Hot Wife","Stag Night",
+    "Velvet Vixen","Playroom Pro","Voyeur Vision","After Dark",
+    "Bare Temptation","Swing Set","Sultry Eyes","Naughty List",
+    "Dom Curious","Unicorn Dust","Cherry Popper","Dirty Martini",
+    "Lust Lounge","Midnight Tease","Fantasy Fuel","Room 69","Wet Bar",
+    "No Limits","Satin Sheets","Wild Card"
 ]
 
 # ---------- STRIPE SETUP ----------
@@ -43,17 +43,16 @@ stripe.api_key = STRIPE_API_KEY
 # ---------- HELPERS ----------
 def get_sale_date() -> datetime.date:
     now = datetime.datetime.now()
-    # if before 1 AM, treat it as previous night
     return (now.date() - datetime.timedelta(days=1)) if now.hour < 1 else now.date()
 
 def iso_date(d: datetime.date) -> str:
     return d.isoformat()
 
 def human_date(d: datetime.date) -> str:
-    return d.strftime("%A, %B %-d, %Y")  # e.g. Friday, April 18, 2025
+    return d.strftime("%A, %B %-d, %Y")
 
 def human_short_date(d: datetime.date) -> str:
-    return d.strftime("%b %-d")           # e.g. Apr 18
+    return d.strftime("%b %-d")
 
 def load_json(path):
     with open(path, 'r') as f:
@@ -71,13 +70,13 @@ if not os.path.exists(PHRASES_FILE):
     save_json(PHRASES_FILE, {})
 
 def ensure_phrases_for(date_iso):
-    all_phrases = load_json(PHRASES_FILE)
-    if date_iso not in all_phrases:
+    p = load_json(PHRASES_FILE)
+    if date_iso not in p:
         pool = DAILY_PHRASES.copy()
         random.shuffle(pool)
-        all_phrases[date_iso] = pool
-        save_json(PHRASES_FILE, all_phrases)
-    return all_phrases[date_iso]
+        p[date_iso] = pool
+        save_json(PHRASES_FILE, p)
+    return p[date_iso]
 
 def load_sales():
     return load_json(SALES_FILE)
@@ -86,21 +85,20 @@ def save_sales(data):
     save_json(SALES_FILE, data)
 
 def get_counts():
-    sales = load_sales()
+    s = load_sales()
     key = iso_date(get_sale_date())
-    day = sales.get(key, {"ATL": [], "FL": []})
+    day = s.get(key, {"ATL": [], "FL": []})
     return {"ATL": len(day["ATL"]), "FL": len(day["FL"])}
 
 def record_sale(session_id, discord_id, location, sale_date_iso):
     all_sales = load_sales()
     day = all_sales.setdefault(sale_date_iso, {"ATL": [], "FL": []})
-    # avoid dupes
-    if session_id not in [s["session"] for s in day[location]]:
+    if session_id not in [e["session"] for e in day[location]]:
         day[location].append({"session": session_id, "user": discord_id})
         save_sales(all_sales)
     return len(day[location])
 
-# ---------- FLASK WEBHOOK SERVER ----------
+# ---------- FLASK WEBHOOK ----------
 app = Flask('')
 
 @app.route('/stripe_webhook', methods=['POST'])
@@ -110,22 +108,19 @@ def stripe_webhook():
         event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
     except Exception:
         return abort(400)
-    if event['type'] == 'checkout.session.completed':
+    if event['type']=="checkout.session.completed":
         sess = event['data']['object']
-        meta = sess.get('metadata', {})
-        user_id   = int(meta.get('discord_id', 0))
-        location  = meta.get('location')
-        sale_date = meta.get('sale_date')
-        count = record_sale(sess['id'], user_id, location, sale_date)
-        user = bot.get_user(user_id)
+        meta = sess.get('metadata',{})
+        uid   = int(meta.get('discord_id',0))
+        loc   = meta.get('location')
+        dt    = meta.get('sale_date')
+        count = record_sale(sess['id'], uid, loc, dt)
+        user  = bot.get_user(uid)
         if user:
             discord.utils.asyncio.create_task(
-                user.send(
-                    f"✅ Payment confirmed! You are pass **#{count}/25** "
-                    f"for {location} on {human_date(get_sale_date())}."
-                )
+                user.send(f"✅ Payment confirmed! You are pass **#{count}/25** for {loc} on {human_date(get_sale_date())}.")
             )
-    return '', 200
+    return '',200
 
 def run_web():
     app.run(host='0.0.0.0', port=8080)
@@ -147,99 +142,87 @@ class SkipButtonView(ui.View):
 
     def refresh(self):
         self.clear_items()
-        counts  = get_counts()
-        sale_dt = get_sale_date()
-        # First line only—mobile will only show line 1
-        lbl_atl = f"ATL {human_short_date(sale_dt)} ({counts['ATL']}/25)"
-        lbl_fl  = f"FL  {human_short_date(sale_dt)} ({counts['FL']}/25)"
+        c = get_counts()
+        d = get_sale_date()
+        lbl_atl = f"ATL {human_short_date(d)} ({c['ATL']}/25)"
+        lbl_fl  = f"FL  {human_short_date(d)} ({c['FL']}/25)"
+
         self.add_item(ui.Button(
             label=lbl_atl,
-            style=discord.ButtonStyle.success if counts['ATL']<25 else discord.ButtonStyle.secondary,
+            style=discord.ButtonStyle.success if c['ATL']<25 else discord.ButtonStyle.secondary,
             custom_id="buy_skip_atl",
-            disabled=(counts['ATL']>=25)
+            disabled=(c['ATL']>=25)
         ))
         self.add_item(ui.Button(
             label=lbl_fl,
-            style=discord.ButtonStyle.success if counts['FL']<25 else discord.ButtonStyle.secondary,
+            style=discord.ButtonStyle.success if c['FL']<25 else discord.ButtonStyle.secondary,
             custom_id="buy_skip_fl",
-            disabled=(counts['FL']>=25)
+            disabled=(c['FL']>=25)
         ))
 
-    async def _start_checkout(self, interaction: Interaction, location: str):
-        # defer so we don’t hit Discord’s 3 s limit
-        await interaction.response.defer(ephemeral=True)
-        sale_date_iso = iso_date(get_sale_date())
-        ensure_phrases_for(sale_date_iso)
+    async def _start_checkout(self, inter: Interaction, loc: str):
+        await inter.response.defer(ephemeral=True)
+        sale_iso = iso_date(get_sale_date())
+        ensure_phrases_for(sale_iso)
+        price = PRICE_ID_ATL if loc=='ATL' else PRICE_ID_FL
 
-        price = PRICE_ID_ATL if location=='ATL' else PRICE_ID_FL
-        # run Stripe call in thread
         sess = await asyncio.to_thread(stripe.checkout.Session.create,
             payment_method_types=['card'],
             line_items=[{'price': price, 'quantity':1}],
             mode='payment',
             success_url = SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
             cancel_url  = CANCEL_URL,
-            metadata={
-                'discord_id': str(interaction.user.id),
-                'location':   location,
-                'sale_date':  sale_date_iso
-            }
+            metadata={'discord_id':str(inter.user.id),'location':loc,'sale_date':sale_iso}
         )
-        # now follow up
-        await interaction.followup.send(
-            f"💳 Complete purchase here:\n{sess.url}", ephemeral=True
-        )
+        await inter.followup.send(f"💳 Complete purchase here:\n{sess.url}", ephemeral=True)
 
     @ui.button(custom_id="buy_skip_atl")
-    async def buy_atl(self, button, interaction):
-        await self._start_checkout(interaction, 'ATL')
+    async def buy_atl(self, b, inter: Interaction):
+        await self._start_checkout(inter, 'ATL')
 
     @ui.button(custom_id="buy_skip_fl")
-    async def buy_fl(self, button, interaction):
-        await self._start_checkout(interaction, 'FL')
+    async def buy_fl(self, b, inter: Interaction):
+        await self._start_checkout(inter, 'FL')
 
 # ---------- SLASH COMMANDS ----------
-
 @tree.command(name="setup_skip", description="(Owner) Post skip‑line buttons")
 async def setup_skip(inter: Interaction):
     if inter.user.id != inter.guild.owner_id:
         return await inter.response.send_message("⛔ Only the owner.", ephemeral=True)
 
-    # 1) acknowledge
-    await inter.response.send_message("✅ Buttons have been posted.", ephemeral=True)
+    # 1) defer, then continue
+    await inter.response.defer(ephemeral=True)
 
-    # 2) post in channel
     channel = bot.get_channel(SKIP_CHANNEL_ID)
     if not channel:
-        return await channel.send("❌ Bad SKIP_CHANNEL_ID.")
+        return await inter.followup.send("❌ Invalid SKIP_CHANNEL_ID.", ephemeral=True)
+
     view = SkipButtonView()
-    bot.add_view(view)  # persistent
+    bot.add_view(view)  # make persistent
     await channel.send(
-        "🎟️ **Skip‑Line Passes** — 25 max/night, $25 each. Pick your location & date:",
+        "🎟️ **Skip‑Line Passes** — 25 max/night, $25 each.\nPick your location & date:",
         view=view
     )
+
+    # 2) final confirmation
+    await inter.followup.send("✅ Buttons have been posted.", ephemeral=True)
 
 @tree.command(name="list_phrases", description="(Owner) Show tonight’s passphrases")
 async def list_phrases(inter: Interaction):
     if inter.user.id != inter.guild.owner_id:
         return await inter.response.send_message("⛔ Only the owner.", ephemeral=True)
+    d   = get_sale_date(); iso = iso_date(d)
+    p   = ensure_phrases_for(iso)
+    txt = "**Passphrases for %s**\n" % human_date(d) + "\n".join(f"{i+1:2d}/25 — {w}" for i,w in enumerate(p))
+    await inter.response.send_message(txt, ephemeral=True)
 
-    sale_dt = get_sale_date()
-    iso = iso_date(sale_dt)
-    phrases = ensure_phrases_for(iso)
-    lines = [f"{i+1:2d}/25 — {p}" for i,p in enumerate(phrases)]
-    text  = f"**Passphrases for {human_date(sale_dt)}**\n" + "\n".join(lines)
-    await inter.response.send_message(text, ephemeral=True)
-
-# … (other owner commands: list_sales, remove_sale, move_sale unchanged) …
+# … (repeat your list_sales/remove_sale/move_sale here) …
 
 # ---------- STARTUP & SYNC ----------
 @bot.event
 async def on_ready():
     keep_alive()
-    # register persistent view so old buttons still work
     bot.add_view(SkipButtonView())
-    # sync slash commands globally
     await tree.sync()
     print(f"✅ SkipBot online as {bot.user}")
 
