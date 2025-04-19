@@ -1,6 +1,9 @@
 # skipbot.py
 
-import os, json, datetime
+import os
+import json
+import datetime
+import asyncio
 from threading import Thread
 from zoneinfo import ZoneInfo
 
@@ -26,9 +29,8 @@ MAX_PER_NIGHT         = 25
 
 stripe.api_key = STRIPE_API_KEY
 
-# ---------- HELPERS ----------
+# ---------- HELPERS & PERSISTENCE ----------
 def get_sale_date() -> str:
-    """Return ISO date, attributing early‐morning sales to the prior night."""
     now = datetime.datetime.now(ZoneInfo("America/New_York"))
     if now.hour < 1:
         now -= datetime.timedelta(days=1)
@@ -48,8 +50,7 @@ def save_sales(data: dict):
 def record_sale(session_id: str, discord_id: int, location: str, date_iso: str) -> int:
     all_sales = load_sales()
     day = all_sales.setdefault(date_iso, {"ATL": [], "FL": []})
-    # avoid double‐counting the same session
-    if session_id not in [s["session"] for s in day[location]]:
+    if session_id not in (s["session"] for s in day[location]):
         day[location].append({"session": session_id, "user": discord_id})
         save_sales(all_sales)
     return len(day[location])
@@ -67,23 +68,28 @@ def stripe_webhook():
         evt = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
     except Exception:
         return abort(400)
+
     if evt["type"] == "checkout.session.completed":
         sess = evt["data"]["object"]
         meta = sess.get("metadata", {})
-        uid   = int(meta.get("discord_id", 0))
-        loc   = meta.get("location")
-        date  = meta.get("sale_date")
-        sid   = sess.get("id")
+        uid  = int(meta.get("discord_id", 0))
+        loc  = meta.get("location")
+        date = meta.get("sale_date")
+        sid  = sess.get("id")
+
         if loc and date and sid:
             cnt = record_sale(sid, uid, loc, date)
             user = bot.get_user(uid)
             if user:
-                discord.utils.asyncio.create_task(
+                # schedule the DM send on the bot's event loop
+                asyncio.run_coroutine_threadsafe(
                     user.send(
                         f"✅ Payment confirmed! You’re pass **#{cnt}/{MAX_PER_NIGHT}** "
-                        f"for **{loc}** on **{datetime.datetime.fromisoformat(date).strftime('%b %-d, %Y')}**."
-                    )
+                        f"for **{loc}** on **{datetime.datetime.fromisoformat(date).strftime('%b %-d, %Y')}**."
+                    ),
+                    bot.loop
                 )
+
     return "", 200
 
 def run_web():
@@ -100,7 +106,7 @@ bot  = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 # ---------- SLASH COMMANDS ----------
-@app_commands.command(name="atl", description="Purchase an ATL Skip‑Line pass")
+@tree.command(name="atl", description="Purchase an ATL Skip‑Line pass")
 async def atl(inter: Interaction):
     sold = get_count("ATL")
     left = MAX_PER_NIGHT - sold
@@ -110,7 +116,6 @@ async def atl(inter: Interaction):
         )
         return
 
-    # build Stripe Checkout
     date_iso = get_sale_date()
     sess = stripe.checkout.Session.create(
         payment_method_types=["card"],
@@ -130,7 +135,7 @@ async def atl(inter: Interaction):
         ephemeral=True
     )
 
-@app_commands.command(name="fl", description="Purchase an FL Skip‑Line pass")
+@tree.command(name="fl", description="Purchase an FL Skip‑Line pass")
 async def fl(inter: Interaction):
     sold = get_count("FL")
     left = MAX_PER_NIGHT - sold
@@ -158,9 +163,6 @@ async def fl(inter: Interaction):
         f"💳 **{left}** tickets left for FL tonight. Complete purchase: {sess.url}",
         ephemeral=True
     )
-
-tree.add_command(atl)
-tree.add_command(fl)
 
 # ---------- STARTUP & SYNC ----------
 @bot.event
