@@ -1,21 +1,26 @@
 # skipbot.py
 
-import os, json, datetime, random, stripe
-from threading    import Thread
-from zoneinfo     import ZoneInfo
+import os
+import json
+import datetime
+import random
+import stripe
+from threading import Thread
+from zoneinfo import ZoneInfo
 
 import discord
-from discord      import app_commands, ui, Interaction
-from discord.ext  import commands
-from flask        import Flask, request, abort
+from discord import app_commands, ui, Interaction
+from discord.ext import commands
+from flask import Flask, request, abort
 
 # ---------- CONFIG ----------
-GUILD_ID               = int(os.getenv("GUILD_ID", "0"))
+GUILD_ID               = int(os.getenv("GUILD_ID", "0"))          # for guild‑scoped commands
 SKIP_CHANNEL_ID        = int(os.getenv("SKIP_CHANNEL_ID", "0"))
 DATA_DIR               = "data"
 SALES_FILE             = os.path.join(DATA_DIR, "skip_sales.json")
 PHRASES_FILE           = os.path.join(DATA_DIR, "skip_passphrases.json")
 DISCORD_TOKEN          = os.getenv("DISCORD_TOKEN")
+APPLICATION_ID         = int(os.getenv("APPLICATION_ID", "0"))     # your bot’s App ID
 STRIPE_API_KEY         = os.getenv("STRIPE_API_KEY")
 STRIPE_WEBHOOK_SECRET  = os.getenv("STRIPE_WEBHOOK_SECRET")
 PRICE_ID_ATL           = os.getenv("PRICE_ID_ATL")
@@ -98,8 +103,7 @@ def stripe_webhook():
             if user:
                 discord.utils.asyncio.create_task(
                     user.send(
-                        f"✅ Payment confirmed! You’re pass **#{cnt}/25** for {loc} on "
-                        f"{human_date(get_sale_date())}."
+                        f"✅ Payment confirmed! You’re pass **#{cnt}/25** for {loc} on {human_date(get_sale_date())}."
                     )
                 )
     return "", 200
@@ -123,7 +127,7 @@ class SkipView(ui.View):
         date = human_date(get_sale_date())
 
         atl_label = f"ATL — {cnts['ATL']}/25 ({date})" if cnts['ATL'] < 25 else "ATL — SOLD OUT"
-        fl_label  = f"FL — {cnts['FL']}/25 ({date})" if cnts['FL'] < 25 else "FL — SOLD OUT"
+        fl_label  = f"FL  — {cnts['FL']}/25 ({date})" if cnts['FL'] < 25 else "FL  — SOLD OUT"
 
         self.add_item(ui.Button(
             label=atl_label,
@@ -138,7 +142,7 @@ class SkipView(ui.View):
             disabled=(cnts['FL'] >= 25)
         ))
 
-    async def create_session(self, interaction: Interaction, loc: str):
+    async def create_session(self, interaction: Interaction, loc: str) -> str:
         iso   = iso_date(get_sale_date())
         ensure_phrases_for(iso)
         price = PRICE_ID_ATL if loc == "ATL" else PRICE_ID_FL
@@ -174,7 +178,7 @@ class SkipView(ui.View):
         if self.message:
             await self.message.edit(view=self)
 
-# ---------- BOT SUBCLASS with setup_hook ----------
+# ---------- BOT SUBCLASS ----------
 class SkipBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -182,42 +186,34 @@ class SkipBot(commands.Bot):
         super().__init__(
             command_prefix="!",
             intents=intents,
-            application_id=int(os.getenv("APPLICATION_ID", "0"))
+            application_id=APPLICATION_ID
         )
-        self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        # create & register view *after* loop exists
+        # start Flask
+        keep_alive()
+        # register & persist view
         self.skip_view = SkipView()
         self.add_view(self.skip_view)
-        # register slash in your guild only for instant availability
+        # sync a guild‑scoped slash for instant availability
         self.tree.copy_global_to(guild=discord.Object(id=GUILD_ID))
         await self.tree.sync(guild=discord.Object(id=GUILD_ID))
 
     async def on_ready(self):
         print(f"✅ SkipBot online as {self.user}")
-        keep_alive()
 
 bot = SkipBot()
 
-# ---------- Slash to post those buttons ----------
-@bot.tree.command(
-    name="setup_skip",
-    description="(Owner) Post skip‑line buttons",
-)
+# ---------- SLASH TO POST BUTTONS ----------
+@bot.tree.command(name="setup_skip", description="(Owner) Post skip‑line buttons")
 async def setup_skip(interaction: Interaction):
     if interaction.user.id != interaction.guild.owner_id:
         return await interaction.response.send_message("⛔ Only the owner.", ephemeral=True)
 
-    # ACK quickly
     await interaction.response.send_message("✅ Buttons posted.", ephemeral=True)
-
-    # then post them in your channel
     channel = bot.get_channel(SKIP_CHANNEL_ID)
-    msg     = await channel.send(
-        "🎟️ **Skip The Line Passes** — click to buy:",
-        view=bot.skip_view
-    )
+    msg = await channel.send("🎟️ **Skip The Line Passes** — click to buy:",
+                              view=bot.skip_view)
     bot.skip_view.message = msg
 
 # ---------- RUN ----------
