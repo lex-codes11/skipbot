@@ -93,7 +93,7 @@ def get_counts():
 def record_sale(session_id, discord_id, location, sale_date_iso):
     all_sales = load_sales()
     day = all_sales.setdefault(sale_date_iso, {"ATL": [], "FL": []})
-    if session_id not in [e["session"] for e in day[location]]:
+    if session_id and session_id not in [e["session"] for e in day[location]]:
         day[location].append({"session": session_id, "user": discord_id})
         save_sales(all_sales)
     return len(day[location])
@@ -114,7 +114,7 @@ def stripe_webhook():
         uid   = int(meta.get('discord_id',0))
         loc   = meta.get('location')
         dt    = meta.get('sale_date')
-        count = record_sale(sess['id'], uid, loc, dt)
+        count = record_sale(sess.get('id'), uid, loc, dt)
         user  = bot.get_user(uid)
         if user:
             discord.utils.asyncio.create_task(
@@ -190,22 +190,20 @@ async def setup_skip(inter: Interaction):
     if inter.user.id != inter.guild.owner_id:
         return await inter.response.send_message("⛔ Only the owner.", ephemeral=True)
 
-    # 1) defer, then continue
-    await inter.response.defer(ephemeral=True)
-
+    # Post buttons into the target channel
     channel = bot.get_channel(SKIP_CHANNEL_ID)
     if not channel:
-        return await inter.followup.send("❌ Invalid SKIP_CHANNEL_ID.", ephemeral=True)
+        return await inter.response.send_message("❌ Invalid SKIP_CHANNEL_ID.", ephemeral=True)
 
     view = SkipButtonView()
-    bot.add_view(view)  # make persistent
+    bot.add_view(view)  # make buttons persistent
     await channel.send(
         "🎟️ **Skip‑Line Passes** — 25 max/night, $25 each.\nPick your location & date:",
         view=view
     )
 
-    # 2) final confirmation
-    await inter.followup.send("✅ Buttons have been posted.", ephemeral=True)
+    # single acknowledgement back to the user
+    await inter.response.send_message("✅ Buttons have been posted.", ephemeral=True)
 
 @tree.command(name="list_phrases", description="(Owner) Show tonight’s passphrases")
 async def list_phrases(inter: Interaction):
@@ -216,7 +214,7 @@ async def list_phrases(inter: Interaction):
     txt = "**Passphrases for %s**\n" % human_date(d) + "\n".join(f"{i+1:2d}/25 — {w}" for i,w in enumerate(p))
     await inter.response.send_message(txt, ephemeral=True)
 
-# … (repeat your list_sales/remove_sale/move_sale here) …
+# (Include your list_sales, remove_sale, move_sale here, unchanged)
 
 # ---------- STARTUP & SYNC ----------
 @bot.event
