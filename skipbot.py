@@ -1,25 +1,24 @@
 # skipbot.py
 
-import os, json
+import os
+import json
 import datetime
 import random
 import asyncio
-from io import BytesIO
 from threading import Thread
 from zoneinfo import ZoneInfo
 
 import stripe
 import discord
-from discord import app_commands, Interaction, File
+from discord import app_commands, Interaction, File, Embed, Color
 from discord.ext import commands
 from flask import Flask, request, abort
-from PIL import Image, ImageDraw, ImageFont
 
 # ---------- CONFIG ----------
 DATA_DIR              = "data"
 SALES_FILE            = os.path.join(DATA_DIR, "skip_sales.json")
 PHRASES_FILE          = os.path.join(DATA_DIR, "skip_passphrases.json")
-LOGO_PATH             = "logo-icon-text.png"  # place your logo here
+LOGO_PATH             = "logo-icon-text.png"  # make sure this file is in your repo root
 
 DISCORD_TOKEN         = os.getenv("DISCORD_TOKEN")
 STRIPE_API_KEY        = os.getenv("STRIPE_API_KEY")
@@ -33,7 +32,7 @@ MAX_PER_NIGHT         = 25
 
 stripe.api_key = STRIPE_API_KEY
 
-# ---------- HELPERS & PERSISTENCE ----------
+# ---------- HELPERS & STORAGE ----------
 def get_sale_date() -> str:
     now = datetime.datetime.now(ZoneInfo("America/New_York"))
     if now.hour < 1:
@@ -56,7 +55,7 @@ def save_json(path: str, data: dict):
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
 
-def ensure_phrases_for(date_iso: str):
+def ensure_phrases_for(date_iso: str) -> list[str]:
     data = load_json(PHRASES_FILE)
     if date_iso not in data:
         pool = [
@@ -80,8 +79,7 @@ def save_sales(data: dict):
 
 def record_sale(session_id: str, discord_id: int, location: str, date_iso: str) -> int:
     all_sales = load_sales()
-    day       = all_sales.setdefault(date_iso, {"ATL": [], "FL": []})
-    # avoid dupes
+    day = all_sales.setdefault(date_iso, {"ATL": [], "FL": []})
     if session_id not in [s["session"] for s in day[location]]:
         day[location].append({"session": session_id, "user": discord_id})
         save_sales(all_sales)
@@ -90,48 +88,27 @@ def record_sale(session_id: str, discord_id: int, location: str, date_iso: str) 
 def get_count(location: str) -> int:
     return len(load_sales().get(get_sale_date(), {}).get(location, []))
 
-# ---------- TICKET GENERATOR ----------
-async def send_ticket(user: discord.User, phrase: str, date_iso: str, member_id: int):
-    # build an 800×400 white canvas
-    img = Image.new("RGB", (800,400), "white")
-    draw = ImageDraw.Draw(img)
+# ---------- TICKET EMBED & DM ----------
+async def dm_ticket(user: discord.User, phrase: str, date_iso: str):
+    embed = Embed(
+        title="🎟 Skip The Line Pass",
+        color=Color.pink()
+    )
+    embed.set_thumbnail(url="attachment://logo-icon-text.png")
+    embed.add_field(name="Passphrase",   value=phrase,                 inline=False)
+    embed.add_field(name="Member",       value=user.display_name,     inline=True)
+    embed.add_field(name="Valid Date",   value=human_date(date_iso),  inline=True)
 
-    # logo
-    if os.path.exists(LOGO_PATH):
-        logo = Image.open(LOGO_PATH).convert("RGBA")
-        logo.thumbnail((200,100), Image.ANTIALIAS)
-        img.paste(logo, (20,20), logo)
-
-    # fonts
-    title_fnt = ImageFont.load_default()
-    body_fnt  = ImageFont.load_default()
-
-    # title
-    draw.text((250,30), "Skip The Line Pass", font=title_fnt, fill="black")
-
-    # phrase
-    draw.text((50,150), f"Passphrase: {phrase}", font=body_fnt, fill="black")
-
-    # name & member ID
-    draw.text((50,200), f"Member: {user.display_name}", font=body_fnt, fill="black")
-    draw.text((50,230), f"ID: {member_id}", font=body_fnt, fill="black")
-
-    # valid date
-    draw.text((50,280), f"Valid: {human_date(date_iso)}", font=body_fnt, fill="black")
-
-    # save to bytes
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-
-    await user.send(file=File(buf, filename="skip_pass.png"))
+    # send embed with logo attached
+    file = File(LOGO_PATH, filename="logo-icon-text.png")
+    await user.send(embed=embed, file=file)
 
 # ---------- FLASK WEBHOOK ----------
 app = Flask(__name__)
 
 @app.route("/stripe_webhook", methods=["POST"])
 def stripe_webhook():
-    payload, sig = request.get_data(), request.headers.get("Stripe-Signature","")
+    payload, sig = request.get_data(), request.headers.get("Stripe-Signature", "")
     try:
         ev = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
     except Exception:
@@ -140,29 +117,28 @@ def stripe_webhook():
     if ev["type"] == "checkout.session.completed":
         sess    = ev["data"]["object"]
         meta    = sess.get("metadata", {})
-        uid     = int(meta.get("discord_id",0))
+        uid     = int(meta.get("discord_id", 0))
         loc     = meta.get("location")
         date_iso= meta.get("sale_date")
         sid     = sess.get("id")
 
         if loc and date_iso and sid:
-            cnt      = record_sale(sid, uid, loc, date_iso)
-            phrases  = ensure_phrases_for(date_iso)
-            phrase   = phrases[cnt-1]  # nth sale → nth phrase
-            user     = bot.get_user(uid)
+            count   = record_sale(sid, uid, loc, date_iso)
+            phrases = ensure_phrases_for(date_iso)
+            phrase  = phrases[count - 1]  # pick nth phrase
+            user    = bot.get_user(uid)
             if user:
+                # send the confirmation & ticket on the bot loop
                 loop = bot.loop
-                # send simple text DM
                 asyncio.run_coroutine_threadsafe(
                     user.send(
-                        f"✅ Payment confirmed! You’re pass **#{cnt}/{MAX_PER_NIGHT}** "
+                        f"✅ Payment confirmed! You’re pass **#{count}/{MAX_PER_NIGHT}** "
                         f"for **{loc}** on **{human_date(date_iso)}**."
                     ),
                     loop
                 )
-                # send the fancy ticket image
                 asyncio.run_coroutine_threadsafe(
-                    send_ticket(user, phrase, date_iso, uid),
+                    dm_ticket(user, phrase, date_iso),
                     loop
                 )
 
@@ -184,15 +160,17 @@ tree = bot.tree
 # ---------- SLASH COMMANDS ----------
 @tree.command(name="atl", description="Purchase an ATL Skip‑Line pass")
 async def atl(inter: Interaction):
-    sold = get_count("ATL"); left = MAX_PER_NIGHT - sold
+    sold = get_count("ATL")
+    left = MAX_PER_NIGHT - sold
     if left <= 0:
         return await inter.response.send_message(
-            f"❌ ATL sold out ({sold}/{MAX_PER_NIGHT}).", ephemeral=True
+            f"❌ ATL is sold out ({sold}/{MAX_PER_NIGHT}).", ephemeral=True
         )
+
     date_iso = get_sale_date()
     sess = stripe.checkout.Session.create(
         payment_method_types=["card"],
-        line_items=[{"price": PRICE_ID_ATL, "quantity":1}],
+        line_items=[{"price": PRICE_ID_ATL, "quantity": 1}],
         mode="payment",
         success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
         cancel_url=CANCEL_URL,
@@ -202,22 +180,25 @@ async def atl(inter: Interaction):
             "sale_date":  date_iso
         }
     )
+
     await inter.response.send_message(
-        f"💳 {left} left for ATL tonight—complete purchase: {sess.url}",
+        f"💳 **{left}** left for ATL tonight – complete purchase: {sess.url}",
         ephemeral=True
     )
 
 @tree.command(name="fl", description="Purchase an FL Skip‑Line pass")
 async def fl(inter: Interaction):
-    sold = get_count("FL"); left = MAX_PER_NIGHT - sold
+    sold = get_count("FL")
+    left = MAX_PER_NIGHT - sold
     if left <= 0:
         return await inter.response.send_message(
-            f"❌ FL sold out ({sold}/{MAX_PER_NIGHT}).", ephemeral=True
+            f"❌ FL is sold out ({sold}/{MAX_PER_NIGHT}).", ephemeral=True
         )
+
     date_iso = get_sale_date()
     sess = stripe.checkout.Session.create(
         payment_method_types=["card"],
-        line_items=[{"price": PRICE_ID_FL, "quantity":1}],
+        line_items=[{"price": PRICE_ID_FL, "quantity": 1}],
         mode="payment",
         success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
         cancel_url=CANCEL_URL,
@@ -227,8 +208,9 @@ async def fl(inter: Interaction):
             "sale_date":  date_iso
         }
     )
+
     await inter.response.send_message(
-        f"💳 {left} left for FL tonight—complete purchase: {sess.url}",
+        f"💳 **{left}** left for FL tonight – complete purchase: {sess.url}",
         ephemeral=True
     )
 
