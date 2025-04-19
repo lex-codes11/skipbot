@@ -5,8 +5,8 @@ from threading import Thread
 from zoneinfo import ZoneInfo
 
 import discord
+from discord import app_commands, ui, Interaction
 from discord.ext import commands
-from discord import ui
 from flask import Flask, request, abort
 
 # ---------- CONFIG ----------
@@ -21,14 +21,16 @@ PRICE_ID_ATL          = os.getenv("PRICE_ID_ATL")
 PRICE_ID_FL           = os.getenv("PRICE_ID_FL")
 SUCCESS_URL           = os.getenv("SUCCESS_URL")
 CANCEL_URL            = os.getenv("CANCEL_URL")
+SKIP_CHANNEL_ID       = int(os.getenv("SKIP_CHANNEL_ID","0"))
 
+# one‑time daily phrases (for your staff list, unchanged here)
 DAILY_PHRASES = [
     "Pineapples","Kinkster","Certified Freak","Hot Wife","Stag Night",
     "Velvet Vixen","Playroom Pro","Voyeur Vision","After Dark",
     "Bare Temptation","Swing Set","Sultry Eyes","Naughty List",
     "Dom Curious","Unicorn Dust","Cherry Popper","Dirty Martini",
-    "Lust Lounge","Midnight Tease","Fantasy Fuel","Room 69","Wet Bar",
-    "No Limits","Satin Sheets","Wild Card"
+    "Lust Lounge","Midnight Tease","Fantasy Fuel","Room 69","Wet Bar",
+    "No Limits","Satin Sheets","Wild Card"
 ]
 
 stripe.api_key = STRIPE_API_KEY
@@ -36,33 +38,32 @@ stripe.api_key = STRIPE_API_KEY
 # ---------- HELPERS & PERSISTENCE ----------
 def get_sale_date() -> datetime.date:
     now = datetime.datetime.now(ZoneInfo("America/New_York"))
-    # sales before 1 AM count for previous night
     return (now - datetime.timedelta(days=1)).date() if now.hour < 1 else now.date()
 
 def iso_date(d: datetime.date) -> str:
     return d.isoformat()
 
 def human_date(d: datetime.date) -> str:
-    return d.strftime("%b %-d, %Y")
+    return d.strftime("%b %-d, %Y")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 if not os.path.exists(SALES_FILE):   open(SALES_FILE,"w").write("{}")
 if not os.path.exists(PHRASES_FILE): open(PHRASES_FILE,"w").write("{}")
 
 def load_json(path):
-    return json.load(open(path, "r"))
+    return json.load(open(path))
 
 def save_json(path, data):
-    json.dump(data, open(path, "w"), indent=2)
+    json.dump(data, open(path,"w"), indent=2)
 
 def get_counts():
     today = iso_date(get_sale_date())
     day   = load_json(SALES_FILE).get(today, {"ATL": [], "FL": []})
     return {"ATL": len(day["ATL"]), "FL": len(day["FL"])}
 
-def record_sale(session_id, discord_id, loc, sale_date_iso):
+def record_sale(session_id, discord_id, loc, date_iso):
     all_s = load_json(SALES_FILE)
-    day   = all_s.setdefault(sale_date_iso, {"ATL": [], "FL": []})
+    day   = all_s.setdefault(date_iso, {"ATL": [], "FL": []})
     if session_id not in [x["session"] for x in day[loc]]:
         day[loc].append({"session": session_id, "user": discord_id})
         save_json(SALES_FILE, all_s)
@@ -109,58 +110,98 @@ def keep_alive(): Thread(target=run_web, daemon=True).start()
 intents = discord.Intents.default()
 intents.members = True
 bot    = commands.Bot(command_prefix="!", intents=intents)
+tree   = bot.tree
 
-# ---------- URL BUTTON VIEW ----------
-class URLView(ui.View):
-    def __init__(self, url: str):
+# ---------- PERSISTENT BUTTON VIEW ----------
+class SkipView(ui.View):
+    def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(ui.Button(label="🔗 Complete Purchase", style=discord.ButtonStyle.link, url=url))
+        self.message = None
+        self.refresh()
 
-# ---------- PURCHASE HANDLER ----------
-async def handle_purchase(ctx, loc: str):
-    counts = get_counts()
-    left   = 25 - counts[loc]
-    date   = get_sale_date()
-    hdate  = human_date(date)
+    def refresh(self):
+        self.clear_items()
+        cnts = get_counts()
+        date = human_date(get_sale_date())
 
-    if left <= 0:
-        return await ctx.send(f"❌ **{loc}** is sold out for **{hdate}**.")
+        atl_label = f"ATL — {cnts['ATL']}/25 ({date})" if cnts['ATL']<25 else "ATL — SOLD OUT"
+        fl_label  = f"FL — {cnts['FL']}/25 ({date})" if cnts['FL']<25 else "FL — SOLD OUT"
 
-    # create session
-    iso = iso_date(date)
-    ensure_phrases_for(iso)
-    price = PRICE_ID_ATL if loc=="ATL" else PRICE_ID_FL
+        self.add_item(ui.Button(
+            label=atl_label,
+            custom_id="buy_atl",
+            style=discord.ButtonStyle.primary,
+            disabled=(cnts['ATL']>=25)
+        ))
+        self.add_item(ui.Button(
+            label=fl_label,
+            custom_id="buy_fl",
+            style=discord.ButtonStyle.primary,
+            disabled=(cnts['FL']>=25)
+        ))
 
-    sess = stripe.checkout.Session.create(
-        payment_method_types=["card"],
-        line_items=[{"price": price, "quantity":1}],
-        mode="payment",
-        success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
-        cancel_url=CANCEL_URL,
-        metadata={"discord_id":str(ctx.author.id),"location":loc,"sale_date":iso}
-    )
+    async def create_session(self, interaction: Interaction, loc: str):
+        # record & session
+        iso = iso_date(get_sale_date())
+        ensure_phrases_for(iso)
+        price = PRICE_ID_ATL if loc=="ATL" else PRICE_ID_FL
+        sess = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            line_items=[{"price":price,"quantity":1}],
+            mode="payment",
+            success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
+            cancel_url=CANCEL_URL,
+            metadata={"discord_id":str(interaction.user.id),
+                      "location":loc,"sale_date":iso}
+        )
+        return sess.url
 
-    view = URLView(sess.url)
-    await ctx.send(
-        f"{ctx.author.mention} 💳 Purchase your **{loc}** pass for **{hdate}** — "
-        f"{left} tickets remaining:",
+    @ui.button(custom_id="buy_atl")
+    async def buy_atl(self, button, interaction):
+        # ack immediately
+        await interaction.response.defer(ephemeral=True)
+        url = await self.create_session(interaction, "ATL")
+        # DM the user
+        await interaction.followup.send(f"💳 Complete your ATL purchase: {url}", ephemeral=True)
+        # update counts & button labels
+        self.refresh()
+        if self.message:
+            await self.message.edit(view=self)
+
+    @ui.button(custom_id="buy_fl")
+    async def buy_fl(self, button, interaction):
+        await interaction.response.defer(ephemeral=True)
+        url = await self.create_session(interaction, "FL")
+        await interaction.followup.send(f"💳 Complete your FL purchase: {url}", ephemeral=True)
+        self.refresh()
+        if self.message:
+            await self.message.edit(view=self)
+
+# ---------- SLASH COMMANDS ----------
+@tree.command(name="setup_skip", description="(Owner) Post skip‑line buttons")
+async def setup_skip(interaction: Interaction):
+    if interaction.user.id != interaction.guild.owner_id:
+        return await interaction.response.send_message("⛔ Only the owner.", ephemeral=True)
+
+    view = SkipView()
+    bot.add_view(view)  # make persistent
+
+    # post and keep the message ref for updates
+    msg = await interaction.channel.send(
+        "🎟️ **Skip The Line Passes** — click to buy:",
         view=view
     )
+    view.message = msg
 
-# ---------- PREFIX COMMANDS ----------
-@bot.command(name="atl", help="Buy an ATL skip‑line pass")
-async def atl(ctx):
-    await handle_purchase(ctx, "ATL")
-
-@bot.command(name="fl", help="Buy a FL skip‑line pass")
-async def fl(ctx):
-    await handle_purchase(ctx, "FL")
+    await interaction.response.send_message("✅ Buttons posted.", ephemeral=True)
 
 # ---------- STARTUP ----------
 @bot.event
 async def on_ready():
     keep_alive()
-    print(f"✅ SkipBot running as {bot.user}")
+    # re‑register the view so button callbacks still fire after restarts
+    bot.add_view(SkipView())
+    print(f"✅ SkipBot online as {bot.user}")
 
 # ---------- RUN ----------
 if not DISCORD_TOKEN:
