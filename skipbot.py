@@ -1,10 +1,6 @@
 # skipbot.py
 
-import os
-import json
-import datetime
-import random
-import stripe
+import os, json, datetime, random, stripe
 from threading import Thread
 from zoneinfo import ZoneInfo
 
@@ -40,55 +36,44 @@ stripe.api_key = STRIPE_API_KEY
 # ---------- HELPERS & PERSISTENCE ----------
 def get_sale_date() -> datetime.date:
     now = datetime.datetime.now(ZoneInfo("America/New_York"))
+    # sales before 1 AM count for previous night
     return (now - datetime.timedelta(days=1)).date() if now.hour < 1 else now.date()
 
-def iso_date(dt: datetime.date) -> str:
-    return dt.isoformat()
+def iso_date(d: datetime.date) -> str:
+    return d.isoformat()
 
-def human_date(dt: datetime.date) -> str:
-    return dt.strftime("%b %-d, %Y")
-
-def load_json(path):
-    with open(path, "r") as f:
-        return json.load(f)
-
-def save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+def human_date(d: datetime.date) -> str:
+    return d.strftime("%b %-d, %Y")
 
 os.makedirs(DATA_DIR, exist_ok=True)
-if not os.path.exists(SALES_FILE):
-    save_json(SALES_FILE, {})
-if not os.path.exists(PHRASES_FILE):
-    save_json(PHRASES_FILE, {})
+if not os.path.exists(SALES_FILE):   open(SALES_FILE,"w").write("{}")
+if not os.path.exists(PHRASES_FILE): open(PHRASES_FILE,"w").write("{}")
 
-def load_sales():
-    return load_json(SALES_FILE)
+def load_json(path):
+    return json.load(open(path, "r"))
 
-def save_sales(all_s):
-    save_json(SALES_FILE, all_s)
+def save_json(path, data):
+    json.dump(data, open(path, "w"), indent=2)
 
 def get_counts():
     today = iso_date(get_sale_date())
-    day   = load_sales().get(today, {"ATL": [], "FL": []})
+    day   = load_json(SALES_FILE).get(today, {"ATL": [], "FL": []})
     return {"ATL": len(day["ATL"]), "FL": len(day["FL"])}
 
-def record_sale(session_id, discord_id, loc, date_iso):
-    all_s = load_sales()
-    day   = all_s.setdefault(date_iso, {"ATL": [], "FL": []})
+def record_sale(session_id, discord_id, loc, sale_date_iso):
+    all_s = load_json(SALES_FILE)
+    day   = all_s.setdefault(sale_date_iso, {"ATL": [], "FL": []})
     if session_id not in [x["session"] for x in day[loc]]:
         day[loc].append({"session": session_id, "user": discord_id})
-        save_sales(all_s)
+        save_json(SALES_FILE, all_s)
     return len(day[loc])
 
 def ensure_phrases_for(date_iso):
-    d = load_json(PHRASES_FILE)
-    if date_iso not in d:
-        pool = DAILY_PHRASES.copy()
-        random.shuffle(pool)
-        d[date_iso] = pool
-        save_json(PHRASES_FILE, d)
-    return d[date_iso]
+    p = load_json(PHRASES_FILE)
+    if date_iso not in p:
+        pool = DAILY_PHRASES.copy(); random.shuffle(pool)
+        p[date_iso] = pool; save_json(PHRASES_FILE, p)
+    return p[date_iso]
 
 # ---------- FLASK & STRIPE WEBHOOK ----------
 app = Flask(__name__)
@@ -97,16 +82,16 @@ app = Flask(__name__)
 def stripe_webhook():
     payload, sig = request.get_data(), request.headers.get("Stripe-Signature","")
     try:
-        evt = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+        ev = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
     except Exception:
         return abort(400)
-    if evt["type"] == "checkout.session.completed":
-        sess = evt["data"]["object"]
+    if ev["type"] == "checkout.session.completed":
+        sess = ev["data"]["object"]
         meta = sess.get("metadata", {})
         uid, loc, sdate = int(meta.get("discord_id",0)), meta.get("location"), meta.get("sale_date")
         sid = sess.get("id")
         if loc and sdate and sid:
-            cnt  = record_sale(sid, uid, loc, sdate)
+            cnt = record_sale(sid, uid, loc, sdate)
             user = bot.get_user(uid)
             if user:
                 discord.utils.asyncio.create_task(
@@ -117,115 +102,67 @@ def stripe_webhook():
                 )
     return "", 200
 
-def run_web():
-    app.run(host="0.0.0.0", port=8080)
-
-def keep_alive():
-    Thread(target=run_web, daemon=True).start()
+def run_web():    app.run(host="0.0.0.0", port=8080)
+def keep_alive(): Thread(target=run_web, daemon=True).start()
 
 # ---------- DISCORD SETUP ----------
 intents = discord.Intents.default()
 intents.members = True
-# **Enable message content so prefix commands work**
-intents.message_content = True
-
 bot    = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------- URL BUTTON VIEW ----------
 class URLView(ui.View):
     def __init__(self, url: str):
         super().__init__(timeout=None)
-        self.add_item(ui.Button(
-            label="🔗 Complete Purchase",
-            style=discord.ButtonStyle.link,
-            url=url
-        ))
+        self.add_item(ui.Button(label="🔗 Complete Purchase", style=discord.ButtonStyle.link, url=url))
+
+# ---------- PURCHASE HANDLER ----------
+async def handle_purchase(ctx, loc: str):
+    counts = get_counts()
+    left   = 25 - counts[loc]
+    date   = get_sale_date()
+    hdate  = human_date(date)
+
+    if left <= 0:
+        return await ctx.send(f"❌ **{loc}** is sold out for **{hdate}**.")
+
+    # create session
+    iso = iso_date(date)
+    ensure_phrases_for(iso)
+    price = PRICE_ID_ATL if loc=="ATL" else PRICE_ID_FL
+
+    sess = stripe.checkout.Session.create(
+        payment_method_types=["card"],
+        line_items=[{"price": price, "quantity":1}],
+        mode="payment",
+        success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
+        cancel_url=CANCEL_URL,
+        metadata={"discord_id":str(ctx.author.id),"location":loc,"sale_date":iso}
+    )
+
+    view = URLView(sess.url)
+    await ctx.send(
+        f"{ctx.author.mention} 💳 Purchase your **{loc}** pass for **{hdate}** — "
+        f"{left} tickets remaining:",
+        view=view
+    )
 
 # ---------- PREFIX COMMANDS ----------
-@bot.command(name="ATL")
-async def buy_atl(ctx: commands.Context):
-    loc    = "ATL"
-    counts = get_counts()
-    left   = 25 - counts[loc]
-    date   = human_date(get_sale_date())
+@bot.command(name="atl", help="Buy an ATL skip‑line pass")
+async def atl(ctx):
+    await handle_purchase(ctx, "ATL")
 
-    if left <= 0:
-        return await ctx.send(f"❌ ATL is sold out for {date}.")
+@bot.command(name="fl", help="Buy a FL skip‑line pass")
+async def fl(ctx):
+    await handle_purchase(ctx, "FL")
 
-    await ctx.send(f"⏳ {ctx.author.mention}, preparing your ATL pass…")
-
-    iso   = iso_date(get_sale_date())
-    ensure_phrases_for(iso)
-    price = PRICE_ID_ATL
-
-    sess = stripe.checkout.Session.create(
-        payment_method_types=["card"],
-        line_items=[{"price": price, "quantity":1}],
-        mode="payment",
-        success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
-        cancel_url=CANCEL_URL,
-        metadata={
-            "discord_id": str(ctx.author.id),
-            "location":   loc,
-            "sale_date":  iso
-        }
-    )
-
-    view = URLView(sess.url)
-    try:
-        await ctx.author.send(
-            f"💳 Your ATL pass for **{date}** (#{26-left}/25):",
-            view=view
-        )
-        await ctx.send(f"✅ {ctx.author.mention}, I’ve DMed you the purchase link! ({left} left)")
-    except discord.Forbidden:
-        await ctx.send("❌ I couldn’t DM you. Please open your DMs and try again.")
-
-@bot.command(name="FL")
-async def buy_fl(ctx: commands.Context):
-    loc    = "FL"
-    counts = get_counts()
-    left   = 25 - counts[loc]
-    date   = human_date(get_sale_date())
-
-    if left <= 0:
-        return await ctx.send(f"❌ FL is sold out for {date}.")
-
-    await ctx.send(f"⏳ {ctx.author.mention}, preparing your FL pass…")
-
-    iso   = iso_date(get_sale_date())
-    ensure_phrases_for(iso)
-    price = PRICE_ID_FL
-
-    sess = stripe.checkout.Session.create(
-        payment_method_types=["card"],
-        line_items=[{"price": price, "quantity":1}],
-        mode="payment",
-        success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
-        cancel_url=CANCEL_URL,
-        metadata={
-            "discord_id": str(ctx.author.id),
-            "location":   loc,
-            "sale_date":  iso
-        }
-    )
-
-    view = URLView(sess.url)
-    try:
-        await ctx.author.send(
-            f"💳 Your FL pass for **{date}** (#{26-left}/25):",
-            view=view
-        )
-        await ctx.send(f"✅ {ctx.author.mention}, I’ve DMed you the purchase link! ({left} left)")
-    except discord.Forbidden:
-        await ctx.send("❌ I couldn’t DM you. Please open your DMs and try again.")
-
-# ---------- STARTUP & RUN ----------
+# ---------- STARTUP ----------
 @bot.event
 async def on_ready():
     keep_alive()
-    print(f"✅ SkipBot up as {bot.user} — prefix commands READY (type !ATL or !FL)")
+    print(f"✅ SkipBot running as {bot.user}")
 
+# ---------- RUN ----------
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN")
 bot.run(DISCORD_TOKEN)
