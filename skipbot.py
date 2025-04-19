@@ -1,10 +1,6 @@
 # skipbot.py
 
-import os
-import json
-import datetime
-import random
-import asyncio
+import os, json, datetime, random, asyncio
 from threading import Thread
 from zoneinfo import ZoneInfo
 
@@ -18,7 +14,7 @@ from flask import Flask, request, abort
 DATA_DIR              = "data"
 SALES_FILE            = os.path.join(DATA_DIR, "skip_sales.json")
 PHRASES_FILE          = os.path.join(DATA_DIR, "skip_passphrases.json")
-LOGO_PATH             = "logo-icon-text.png"  # put your logo here
+LOGO_PATH             = "logo-icon-text.png"
 
 DISCORD_TOKEN         = os.getenv("DISCORD_TOKEN")
 STRIPE_API_KEY        = os.getenv("STRIPE_API_KEY")
@@ -110,10 +106,12 @@ def stripe_webhook():
     payload, sig = request.get_data(), request.headers.get("Stripe-Signature", "")
     try:
         ev = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
-    except Exception:
+    except Exception as e:
+        print("⚠️ Webhook signature failed:", e)
         return abort(400)
 
     if ev["type"] == "checkout.session.completed":
+        print("🔔 Received checkout.session.completed")
         sess     = ev["data"]["object"]
         meta     = sess.get("metadata", {})
         uid      = int(meta.get("discord_id", 0))
@@ -128,6 +126,7 @@ def stripe_webhook():
             user    = bot.get_user(uid)
             if user:
                 loop = bot.loop
+                print(f"→ Scheduling DM to {uid}: pass #{count} phrase {phrase}")
                 # confirmation DM
                 asyncio.run_coroutine_threadsafe(
                     user.send(
@@ -136,11 +135,13 @@ def stripe_webhook():
                     ),
                     loop
                 )
-                # ticket DM
-                asyncio.run_coroutine_threadsafe(
-                    dm_ticket(user, phrase, date_iso),
-                    loop
-                )
+                # ticket embed DM
+                def _send_ticket():
+                    try:
+                        return dm_ticket(user, phrase, date_iso)
+                    except Exception as e:
+                        print("❌ dm_ticket error:", e)
+                asyncio.run_coroutine_threadsafe(_send_ticket(), loop)
 
     return "", 200
 
@@ -218,8 +219,8 @@ async def fl(inter: Interaction):
 @bot.event
 async def on_ready():
     keep_alive()
+    print("✅ Logged in as", bot.user)
     await tree.sync()
-    print(f"✅ SkipBot online as {bot.user}")
 
 # ---------- RUN ----------
 if not DISCORD_TOKEN:
