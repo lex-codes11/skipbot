@@ -1,17 +1,17 @@
 # skipbot.py
 
 import os, json, datetime, random, stripe
-from threading import Thread
-from zoneinfo import ZoneInfo
+from threading    import Thread
+from zoneinfo     import ZoneInfo
 
 import discord
-from discord import app_commands, ui, Interaction
-from discord.ext import commands
-from flask import Flask, request, abort
+from discord      import app_commands, ui, Interaction
+from discord.ext  import commands
+from flask        import Flask, request, abort
 
 # ---------- CONFIG ----------
-GUILD_ID               = int(os.getenv("GUILD_ID", "0"))         # your server ID
-SKIP_CHANNEL_ID        = int(os.getenv("SKIP_CHANNEL_ID", "0"))  # where to post buttons
+GUILD_ID               = int(os.getenv("GUILD_ID", "0"))
+SKIP_CHANNEL_ID        = int(os.getenv("SKIP_CHANNEL_ID", "0"))
 DATA_DIR               = "data"
 SALES_FILE             = os.path.join(DATA_DIR, "skip_sales.json")
 PHRASES_FILE           = os.path.join(DATA_DIR, "skip_passphrases.json")
@@ -174,22 +174,23 @@ class SkipView(ui.View):
         if self.message:
             await self.message.edit(view=self)
 
-# ---------- BOT SUBCLASS w/ setup_hook ----------
+# ---------- BOT SUBCLASS with setup_hook ----------
 class SkipBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.members = True
         super().__init__(
-            command_prefix="!", intents=intents,
+            command_prefix="!",
+            intents=intents,
             application_id=int(os.getenv("APPLICATION_ID", "0"))
         )
-        self.skip_view = SkipView()
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        # register persistent view before login
+        # create & register view *after* loop exists
+        self.skip_view = SkipView()
         self.add_view(self.skip_view)
-        # register guild‑scoped slash
+        # register slash in your guild only for instant availability
         self.tree.copy_global_to(guild=discord.Object(id=GUILD_ID))
         await self.tree.sync(guild=discord.Object(id=GUILD_ID))
 
@@ -197,10 +198,9 @@ class SkipBot(commands.Bot):
         print(f"✅ SkipBot online as {self.user}")
         keep_alive()
 
-
 bot = SkipBot()
 
-# ---------- SLASH TO POST BUTTONS ----------
+# ---------- Slash to post those buttons ----------
 @bot.tree.command(
     name="setup_skip",
     description="(Owner) Post skip‑line buttons",
@@ -209,12 +209,12 @@ async def setup_skip(interaction: Interaction):
     if interaction.user.id != interaction.guild.owner_id:
         return await interaction.response.send_message("⛔ Only the owner.", ephemeral=True)
 
-    # ACK immediately
+    # ACK quickly
     await interaction.response.send_message("✅ Buttons posted.", ephemeral=True)
 
-    # post in designated channel
+    # then post them in your channel
     channel = bot.get_channel(SKIP_CHANNEL_ID)
-    msg = await channel.send(
+    msg     = await channel.send(
         "🎟️ **Skip The Line Passes** — click to buy:",
         view=bot.skip_view
     )
