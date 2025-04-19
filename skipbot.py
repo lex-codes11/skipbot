@@ -10,20 +10,19 @@ from discord.ext import commands
 from flask import Flask, request, abort
 
 # ---------- CONFIG ----------
-DATA_DIR              = "data"
-SALES_FILE            = os.path.join(DATA_DIR, "skip_sales.json")
-PHRASES_FILE          = os.path.join(DATA_DIR, "skip_passphrases.json")
+GUILD_ID             = int(os.getenv("GUILD_ID", "0"))
+DATA_DIR             = "data"
+SALES_FILE           = os.path.join(DATA_DIR, "skip_sales.json")
+PHRASES_FILE         = os.path.join(DATA_DIR, "skip_passphrases.json")
+DISCORD_TOKEN        = os.getenv("DISCORD_TOKEN")
+STRIPE_API_KEY       = os.getenv("STRIPE_API_KEY")
+STRIPE_WEBHOOK_SECRET= os.getenv("STRIPE_WEBHOOK_SECRET")
+PRICE_ID_ATL         = os.getenv("PRICE_ID_ATL")
+PRICE_ID_FL          = os.getenv("PRICE_ID_FL")
+SUCCESS_URL          = os.getenv("SUCCESS_URL")
+CANCEL_URL           = os.getenv("CANCEL_URL")
+SKIP_CHANNEL_ID      = int(os.getenv("SKIP_CHANNEL_ID","0"))
 
-DISCORD_TOKEN         = os.getenv("DISCORD_TOKEN")
-STRIPE_API_KEY        = os.getenv("STRIPE_API_KEY")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
-PRICE_ID_ATL          = os.getenv("PRICE_ID_ATL")
-PRICE_ID_FL           = os.getenv("PRICE_ID_FL")
-SUCCESS_URL           = os.getenv("SUCCESS_URL")
-CANCEL_URL            = os.getenv("CANCEL_URL")
-SKIP_CHANNEL_ID       = int(os.getenv("SKIP_CHANNEL_ID","0"))
-
-# one‑time daily phrases (for your staff list, unchanged here)
 DAILY_PHRASES = [
     "Pineapples","Kinkster","Certified Freak","Hot Wife","Stag Night",
     "Velvet Vixen","Playroom Pro","Voyeur Vision","After Dark",
@@ -47,8 +46,8 @@ def human_date(d: datetime.date) -> str:
     return d.strftime("%b %-d, %Y")
 
 os.makedirs(DATA_DIR, exist_ok=True)
-if not os.path.exists(SALES_FILE):   open(SALES_FILE,"w").write("{}")
-if not os.path.exists(PHRASES_FILE): open(PHRASES_FILE,"w").write("{}")
+if not os.path.exists(SALES_FILE):    open(SALES_FILE,   "w").write("{}")
+if not os.path.exists(PHRASES_FILE):  open(PHRASES_FILE, "w").write("{}")
 
 def load_json(path):
     return json.load(open(path))
@@ -97,8 +96,7 @@ def stripe_webhook():
             if user:
                 discord.utils.asyncio.create_task(
                     user.send(
-                        f"✅ Payment confirmed! You’re pass **#{cnt}/25** for {loc} on "
-                        f"{human_date(get_sale_date())}."
+                        f"✅ Payment confirmed! You’re pass **#{cnt}/25** for {loc} on {human_date(get_sale_date())}."
                     )
                 )
     return "", 200
@@ -109,8 +107,8 @@ def keep_alive(): Thread(target=run_web, daemon=True).start()
 # ---------- DISCORD SETUP ----------
 intents = discord.Intents.default()
 intents.members = True
-bot    = commands.Bot(command_prefix="!", intents=intents)
-tree   = bot.tree
+bot  = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
 
 # ---------- PERSISTENT BUTTON VIEW ----------
 class SkipView(ui.View):
@@ -125,7 +123,7 @@ class SkipView(ui.View):
         date = human_date(get_sale_date())
 
         atl_label = f"ATL — {cnts['ATL']}/25 ({date})" if cnts['ATL']<25 else "ATL — SOLD OUT"
-        fl_label  = f"FL — {cnts['FL']}/25 ({date})" if cnts['FL']<25 else "FL — SOLD OUT"
+        fl_label  = f"FL — {cnts['FL']}/25 ({date})" if cnts['FL']<25 else "FL — SOLD OUT"
 
         self.add_item(ui.Button(
             label=atl_label,
@@ -141,35 +139,34 @@ class SkipView(ui.View):
         ))
 
     async def create_session(self, interaction: Interaction, loc: str):
-        # record & session
-        iso = iso_date(get_sale_date())
+        iso   = iso_date(get_sale_date())
         ensure_phrases_for(iso)
         price = PRICE_ID_ATL if loc=="ATL" else PRICE_ID_FL
-        sess = stripe.checkout.Session.create(
+        sess  = stripe.checkout.Session.create(
             payment_method_types=["card"],
             line_items=[{"price":price,"quantity":1}],
             mode="payment",
             success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
             cancel_url=CANCEL_URL,
-            metadata={"discord_id":str(interaction.user.id),
-                      "location":loc,"sale_date":iso}
+            metadata={
+                "discord_id":str(interaction.user.id),
+                "location":loc,
+                "sale_date":iso
+            }
         )
         return sess.url
 
     @ui.button(custom_id="buy_atl")
-    async def buy_atl(self, button, interaction):
-        # ack immediately
+    async def buy_atl(self, _btn, interaction: Interaction):
         await interaction.response.defer(ephemeral=True)
         url = await self.create_session(interaction, "ATL")
-        # DM the user
         await interaction.followup.send(f"💳 Complete your ATL purchase: {url}", ephemeral=True)
-        # update counts & button labels
         self.refresh()
         if self.message:
             await self.message.edit(view=self)
 
     @ui.button(custom_id="buy_fl")
-    async def buy_fl(self, button, interaction):
+    async def buy_fl(self, _btn, interaction: Interaction):
         await interaction.response.defer(ephemeral=True)
         url = await self.create_session(interaction, "FL")
         await interaction.followup.send(f"💳 Complete your FL purchase: {url}", ephemeral=True)
@@ -177,33 +174,40 @@ class SkipView(ui.View):
         if self.message:
             await self.message.edit(view=self)
 
-# ---------- SLASH COMMANDS ----------
-@tree.command(name="setup_skip", description="(Owner) Post skip‑line buttons")
+# ---------- SLASH COMMAND (guild‑only) ----------
+@tree.command(
+    name="setup_skip",
+    description="(Owner) Post skip‑line buttons",
+    guild=discord.Object(id=GUILD_ID)
+)
 async def setup_skip(interaction: Interaction):
     if interaction.user.id != interaction.guild.owner_id:
         return await interaction.response.send_message("⛔ Only the owner.", ephemeral=True)
 
     view = SkipView()
-    bot.add_view(view)  # make persistent
+    bot.add_view(view)  # persist across restarts
 
-    # post and keep the message ref for updates
-    msg = await interaction.channel.send(
+    # ACK the command
+    await interaction.response.send_message("✅ Buttons posted.", ephemeral=True)
+
+    # Post your buttons in the designated channel
+    channel = bot.get_channel(SKIP_CHANNEL_ID)
+    msg = await channel.send(
         "🎟️ **Skip The Line Passes** — click to buy:",
         view=view
     )
     view.message = msg
 
-    await interaction.response.send_message("✅ Buttons posted.", ephemeral=True)
-
-# ---------- STARTUP ----------
+# ---------- STARTUP & SYNC ----------
 @bot.event
 async def on_ready():
     keep_alive()
-    # re‑register the view so button callbacks still fire after restarts
+    # re‑register the view so buttons still work after restarts
     bot.add_view(SkipView())
-    print(f"✅ SkipBot online as {bot.user}")
+    # sync only to your dev guild
+    await tree.sync(guild=discord.Object(id=GUILD_ID))
+    print(f"✅ SkipBot online as {bot.user} (commands synced to guild {GUILD_ID})")
 
-# ---------- RUN ----------
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN")
 bot.run(DISCORD_TOKEN)
