@@ -1,9 +1,6 @@
 # skipbot.py
 
-import os
-import json
-import datetime
-import random
+import os, json, datetime, random
 import asyncio
 from threading import Thread
 from zoneinfo import ZoneInfo
@@ -15,7 +12,6 @@ from discord.ext import commands
 from flask import Flask, request, abort
 
 # ---------- CONFIG ----------
-# For Render disk, mount it at e.g. /data and set DATA_DIR=/data
 DATA_DIR              = os.getenv("DATA_DIR", "data")
 SALES_FILE            = os.path.join(DATA_DIR, "skip_sales.json")
 PHRASES_FILE          = os.path.join(DATA_DIR, "skip_passphrases.json")
@@ -30,7 +26,7 @@ CANCEL_URL            = os.getenv("CANCEL_URL")
 
 MAX_PER_NIGHT         = 25
 
-# **Guild‑scoped commands** (register instantly)
+# Guild‑scoped commands
 GUILD_ID = int(os.getenv("GUILD_ID"))
 GUILD    = discord.Object(id=GUILD_ID)
 
@@ -87,7 +83,6 @@ def record_sale(session_id: str, discord_id: int, location: str,
                 date_iso: str, position: int = None) -> int:
     sales = load_sales()
     day   = sales.setdefault(date_iso, {"ATL": [], "FL": []})
-    # remove any existing entry for that session
     day[location] = [s for s in day[location] if s["session"] != session_id]
     entry = {"session": session_id, "user": discord_id}
     if position and 1 <= position <= len(day[location]):
@@ -122,7 +117,6 @@ def stripe_webhook():
         date_iso = meta.get("sale_date")
         sid      = sess.get("id")
         if loc and date_iso and sid:
-            # record it
             record_sale(sid, uid, loc, date_iso)
     return "", 200
 
@@ -135,24 +129,73 @@ def keep_alive():
 # ---------- DISCORD BOT SETUP ----------
 intents = discord.Intents.default()
 intents.members = True
-bot    = commands.Bot(command_prefix="!", intents=intents)
-tree   = bot.tree
+bot  = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
+
+# ---------- USER SLASH COMMANDS ----------
+@tree.command(name="atl", description="Purchase an ATL Skip‑Line pass", guild=GUILD)
+async def atl(inter: Interaction):
+    sold = get_count("ATL")
+    left = MAX_PER_NIGHT - sold
+    if left <= 0:
+        return await inter.response.send_message(
+            f"❌ ATL is sold out ({sold}/{MAX_PER_NIGHT}).", ephemeral=True
+        )
+    date_iso = get_sale_date()
+    human    = human_date(date_iso)
+    sess = stripe.checkout.Session.create(
+        payment_method_types=["card"],
+        line_items=[{"price": PRICE_ID_ATL, "quantity": 1}],
+        mode="payment",
+        success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
+        cancel_url=CANCEL_URL,
+        metadata={
+            "discord_id": str(inter.user.id),
+            "location":   "ATL",
+            "sale_date":  date_iso
+        }
+    )
+    await inter.response.send_message(
+        f"💳 {left} left for ATL on **{human}** — complete purchase: {sess.url}",
+        ephemeral=True
+    )
+
+@tree.command(name="fl", description="Purchase an FL Skip‑Line pass", guild=GUILD)
+async def fl(inter: Interaction):
+    sold = get_count("FL")
+    left = MAX_PER_NIGHT - sold
+    if left <= 0:
+        return await inter.response.send_message(
+            f"❌ FL is sold out ({sold}/{MAX_PER_NIGHT}).", ephemeral=True
+        )
+    date_iso = get_sale_date()
+    human    = human_date(date_iso)
+    sess = stripe.checkout.Session.create(
+        payment_method_types=["card"],
+        line_items=[{"price": PRICE_ID_FL, "quantity": 1}],
+        mode="payment",
+        success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
+        cancel_url=CANCEL_URL,
+        metadata={
+            "discord_id": str(inter.user.id),
+            "location":   "FL",
+            "sale_date":  date_iso
+        }
+    )
+    await inter.response.send_message(
+        f"💳 {left} left for FL on **{human}** — complete purchase: {sess.url}",
+        ephemeral=True
+    )
 
 # ---------- OWNER SLASH COMMANDS ----------
-@tree.command(
-    name="export_sales",
-    description="(Owner) Export sales + passphrases",
-    guild=GUILD
-)
+@tree.command(name="export_sales", description="(Owner) Export sales + passphrases", guild=GUILD)
 @app_commands.describe(date="YYYY‑MM‑DD (defaults to today)")
 async def export_sales(inter: Interaction, date: str = None):
     if not is_owner(inter):
         return await inter.response.send_message("⛔ Only the owner.", ephemeral=True)
-
     date_iso = date or get_sale_date()
     sales    = load_sales().get(date_iso, {"ATL": [], "FL": []})
     phrases  = ensure_phrases_for(date_iso)
-
     lines = [f"**Sales for {human_date(date_iso)}**"]
     for loc in ("ATL","FL"):
         lines.append(f"\n__{loc}__:")
@@ -163,64 +206,30 @@ async def export_sales(inter: Interaction, date: str = None):
             name = user.display_name if user else str(s["user"])
             p    = phrases[i-1] if i-1 < len(phrases) else "—"
             lines.append(f"  {i:2d}. {name} — `{p}`")
-
     text = "\n".join(lines)
     await inter.response.send_message("Here’s the export:", ephemeral=True)
     for chunk in [text[i:i+1900] for i in range(0, len(text), 1900)]:
         await inter.followup.send(chunk)
 
-@tree.command(
-    name="add_sale",
-    description="(Owner) Add a sale manually",
-    guild=GUILD
-)
-@app_commands.describe(
-    location="ATL or FL",
-    member="Which member to add",
-    position="Slot number (1…n), defaults to end"
-)
-@app_commands.choices(location=[
-    app_commands.Choice(name="ATL", value="ATL"),
-    app_commands.Choice(name="FL",  value="FL")
-])
-async def add_sale(
-    inter: Interaction,
-    location: str,
-    member: discord.Member,
-    position: int = None
-):
+@tree.command(name="add_sale", description="(Owner) Add a sale manually", guild=GUILD)
+@app_commands.describe(location="ATL or FL", member="Which member to add", position="Slot number (1…n)")
+@app_commands.choices(location=[app_commands.Choice(name="ATL", value="ATL"),
+                                app_commands.Choice(name="FL",  value="FL")])
+async def add_sale(inter: Interaction, location: str, member: discord.Member, position: int=None):
     if not is_owner(inter):
         return await inter.response.send_message("⛔ Only the owner.", ephemeral=True)
-
     date_iso = get_sale_date()
     sid      = f"manual-{member.id}-{int(datetime.datetime.now().timestamp())}"
     cnt      = record_sale(sid, member.id, location, date_iso, position)
-    await inter.response.send_message(
-        f"✅ Added {member.display_name} to {location} as #{cnt}.",
-        ephemeral=True
-    )
+    await inter.response.send_message(f"✅ Added {member.display_name} to {location} as #{cnt}.", ephemeral=True)
 
-@tree.command(
-    name="remove_sale",
-    description="(Owner) Remove a sale",
-    guild=GUILD
-)
-@app_commands.describe(
-    location="ATL or FL",
-    index="Sale slot number to remove"
-)
-@app_commands.choices(location=[
-    app_commands.Choice(name="ATL", value="ATL"),
-    app_commands.Choice(name="FL",  value="FL")
-])
-async def remove_sale(
-    inter: Interaction,
-    location: str,
-    index: int
-):
+@tree.command(name="remove_sale", description="(Owner) Remove a sale", guild=GUILD)
+@app_commands.describe(location="ATL or FL", index="Sale slot number to remove")
+@app_commands.choices(location=[app_commands.Choice(name="ATL", value="ATL"),
+                                app_commands.Choice(name="FL",  value="FL")])
+async def remove_sale(inter: Interaction, location: str, index: int):
     if not is_owner(inter):
         return await inter.response.send_message("⛔ Only the owner.", ephemeral=True)
-
     date_iso = get_sale_date()
     sales    = load_sales()
     day      = sales.get(date_iso, {"ATL": [], "FL": []})
@@ -229,38 +238,19 @@ async def remove_sale(
         save_sales(sales)
         user    = await bot.fetch_user(removed["user"])
         name    = user.display_name if user else str(removed["user"])
-        await inter.response.send_message(
-            f"🗑️ Removed {name} from {location}.",
-            ephemeral=True
-        )
+        await inter.response.send_message(f"🗑️ Removed {name} from {location}.", ephemeral=True)
     else:
         await inter.response.send_message("❌ Invalid index.", ephemeral=True)
 
-@tree.command(
-    name="move_sale",
-    description="(Owner) Move a sale ATL↔FL",
-    guild=GUILD
-)
-@app_commands.describe(
-    from_loc="From (ATL/FL)",
-    to_loc=  "To (ATL/FL)",
-    index="Slot number to move"
-)
-@app_commands.choices(
-    from_loc=[app_commands.Choice(name="ATL", value="ATL"), app_commands.Choice(name="FL", value="FL")],
-    to_loc=  [app_commands.Choice(name="ATL", value="ATL"), app_commands.Choice(name="FL", value="FL")]
-)
-async def move_sale(
-    inter: Interaction,
-    from_loc: str,
-    to_loc:   str,
-    index:    int
-):
+@tree.command(name="move_sale", description="(Owner) Move a sale ATL↔FL", guild=GUILD)
+@app_commands.describe(from_loc="From (ATL/FL)", to_loc="To (ATL/FL)", index="Slot number to move")
+@app_commands.choices(from_loc=[app_commands.Choice(name="ATL", value="ATL"), app_commands.Choice(name="FL", value="FL")],
+                     to_loc  =[app_commands.Choice(name="ATL", value="ATL"), app_commands.Choice(name="FL", value="FL")])
+async def move_sale(inter: Interaction, from_loc: str, to_loc: str, index: int):
     if not is_owner(inter):
         return await inter.response.send_message("⛔ Only the owner.", ephemeral=True)
     if from_loc == to_loc:
         return await inter.response.send_message("❌ from_loc and to_loc must differ.", ephemeral=True)
-
     date_iso = get_sale_date()
     sales    = load_sales()
     day      = sales.get(date_iso, {"ATL": [], "FL": []})
@@ -270,10 +260,7 @@ async def move_sale(
         dst.append(entry)
         save_sales(sales)
         user = await bot.fetch_user(entry["user"])
-        await inter.response.send_message(
-            f"🔀 Moved {user.display_name if user else entry['user']} → {to_loc}.",
-            ephemeral=True
-        )
+        await inter.response.send_message(f"🔀 Moved {user.display_name if user else entry['user']} → {to_loc}.", ephemeral=True)
     else:
         await inter.response.send_message("❌ Invalid index.", ephemeral=True)
 
@@ -281,7 +268,7 @@ async def move_sale(
 @bot.event
 async def on_ready():
     keep_alive()
-    # register everything into your single guild immediately
+    # register all slash commands into your one guild instantly
     await tree.sync(guild=GUILD)
     print(f"✅ SkipBot online as {bot.user} in guild {GUILD_ID}")
 
