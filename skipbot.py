@@ -25,7 +25,6 @@ PRICE_ID_ATL          = os.getenv("PRICE_ID_ATL")
 PRICE_ID_FL           = os.getenv("PRICE_ID_FL")
 SUCCESS_URL           = os.getenv("SUCCESS_URL")
 CANCEL_URL            = os.getenv("CANCEL_URL")
-SKIP_CHANNEL_ID       = int(os.getenv("SKIP_CHANNEL_ID", "0"))
 
 DAILY_PHRASES = [
     "Pineapples","Kinkster","Certified Freak","Hot Wife","Stag Night",
@@ -36,7 +35,6 @@ DAILY_PHRASES = [
     "No Limits","Satin Sheets","Wild Card"
 ]
 
-# ---------- STRIPE SETUP ----------
 stripe.api_key = STRIPE_API_KEY
 
 # ---------- HELPERS ----------
@@ -88,17 +86,8 @@ def record_sale(session_id: str, discord_id: int, location: str, sale_date_iso: 
         save_sales(all_sales)
     return len(day[location])
 
-def get_counts():
-    key = iso_date(get_sale_date())
-    day = load_sales().get(key, {"ATL": [], "FL": []})
-    return {"ATL": len(day["ATL"]), "FL": len(day["FL"])}
-
-# ---------- FLASK & WEBHOOK ----------
+# ---------- FLASK & STRIPE WEBHOOK ----------
 app = Flask(__name__)
-
-@app.route("/", methods=["GET","HEAD"])
-def health():
-    return "OK", 200
 
 @app.route("/stripe_webhook", methods=["POST"])
 def stripe_webhook():
@@ -133,104 +122,47 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# ---------- BUTTON VIEW ----------
-class SkipButtonView(ui.View):
-    def __init__(self):
+# ---------- URL BUTTON VIEW ----------
+class URLView(ui.View):
+    def __init__(self, url: str):
         super().__init__(timeout=None)
-        self.refresh()
+        # URL‐style button never needs to be “handled” by us
+        self.add_item(ui.Button(label="🔗 Complete Purchase", style=discord.ButtonStyle.link, url=url))
 
-    def refresh(self):
-        self.clear_items()
-        cnts = get_counts()
-        sd   = human_date(get_sale_date())
-
-        # single‐line labels so mobile shows them
-        lbl_atl = f"ATL Pass {sd} ({cnts['ATL']}/25)"
-        lbl_fl  = f"FL Pass {sd} ({cnts['FL']}/25)"
-
-        self.add_item(ui.Button(
-            label=lbl_atl,
-            style=discord.ButtonStyle.success if cnts["ATL"] < 25 else discord.ButtonStyle.secondary,
-            custom_id="buy_skip_atl",
-            disabled=cnts["ATL"] >= 25
-        ))
-        self.add_item(ui.Button(
-            label=lbl_fl,
-            style=discord.ButtonStyle.success if cnts["FL"] < 25 else discord.ButtonStyle.secondary,
-            custom_id="buy_skip_fl",
-            disabled=cnts["FL"] >= 25
-        ))
-
-    async def _checkout(self, interaction: Interaction, loc: str):
-        # defer immediately so Discord doesn’t timeout
-        await interaction.response.defer(ephemeral=True)
-        iso = iso_date(get_sale_date())
-        ensure_phrases_for(iso)
-
-        price = PRICE_ID_ATL if loc == "ATL" else PRICE_ID_FL
-        sess = stripe.checkout.Session.create(
-            payment_method_types=["card"],
-            line_items=[{"price": price, "quantity": 1}],
-            mode="payment",
-            success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
-            cancel_url=CANCEL_URL,
-            metadata={
-                "discord_id": str(interaction.user.id),
-                "location":   loc,
-                "sale_date":  iso
-            }
-        )
-        # now send the real link
-        await interaction.followup.send(f"💳 Complete your purchase: {sess.url}", ephemeral=True)
-
-    @ui.button(custom_id="buy_skip_atl")
-    async def buy_atl(self, _btn, interaction: Interaction):
-        await self._checkout(interaction, "ATL")
-
-    @ui.button(custom_id="buy_skip_fl")
-    async def buy_fl(self, _btn, interaction: Interaction):
-        await self._checkout(interaction, "FL")
-
-# ---------- SLASH COMMANDS ----------
-@tree.command(name="setup_skip", description="(Owner) Post Skip‑Line buttons")
-async def setup_skip(interaction: Interaction):
-    # only owner
-    if interaction.user.id != interaction.guild.owner_id:
-        return await interaction.response.send_message("⛔ Only the owner.", ephemeral=True)
-
-    view = SkipButtonView()
-    bot.add_view(view)  # register for persistence
-
-    # ACK once:
-    await interaction.response.send_message("✅ Buttons posted.", ephemeral=True)
-
-    # post in your channel:
-    channel = bot.get_channel(SKIP_CHANNEL_ID)
-    if not channel:
-        return await interaction.followup.send("❌ Bad SKIP_CHANNEL_ID.", ephemeral=True)
-
-    await channel.send(
-        "🎟️ **Skip The Line Passes**\nChoose your location & date:",
-        view=view
-    )
-
-@tree.command(name="list_phrases", description="(Owner) Show tonight’s passphrases")
-async def list_phrases(interaction: Interaction):
-    if interaction.user.id != interaction.guild.owner_id:
-        return await interaction.response.send_message("⛔ Only the owner.", ephemeral=True)
+# ---------- BUY PASS COMMAND ----------
+@tree.command(name="buy_pass", description="Purchase a Skip‑Line Pass")
+@app_commands.describe(location="Which location to buy for")
+@app_commands.choices(location=[
+    app_commands.Choice(name="ATL", value="ATL"),
+    app_commands.Choice(name="FL", value="FL")
+])
+async def buy_pass(interaction: Interaction, location: str):
+    # create your session
     iso = iso_date(get_sale_date())
-    pool = ensure_phrases_for(iso)
-    text = f"**Passphrases for {human_date(get_sale_date())}**\n" + "\n".join(
-        f"{i+1:2d}/25 — {p}" for i,p in enumerate(pool)
+    ensure_phrases_for(iso)
+
+    price = PRICE_ID_ATL if location == "ATL" else PRICE_ID_FL
+    sess = stripe.checkout.Session.create(
+        payment_method_types=["card"],
+        line_items=[{"price": price, "quantity": 1}],
+        mode="payment",
+        success_url=SUCCESS_URL + "?session_id={CHECKOUT_SESSION_ID}",
+        cancel_url=CANCEL_URL,
+        metadata={
+            "discord_id": str(interaction.user.id),
+            "location":   location,
+            "sale_date":  iso
+        }
     )
-    await interaction.response.send_message(text, ephemeral=True)
+
+    # reply with a **URL button**—no more “interaction failed”
+    view = URLView(sess.url)
+    await interaction.response.send_message(f"💳 Click below to complete your purchase for **{location}** on **{human_date(get_sale_date())}**:", view=view, ephemeral=True)
 
 # ---------- STARTUP & SYNC ----------
 @bot.event
 async def on_ready():
     keep_alive()
-    # re‑register your persistent view so buttons fire
-    bot.add_view(SkipButtonView())
     await tree.sync()
     print(f"✅ SkipBot running as {bot.user}")
 
