@@ -67,20 +67,16 @@ class RSVPModal(ui.Modal, title="VIP RSVP"):
 
     async def on_submit(self, inter: Interaction):
         key = self.id_or_dob.value.strip()
-        # Must be 4 or 6 digits
         if not (key.isdigit() and len(key) in (4,6)):
             return await inter.response.send_message(
-                "❌ Must be 4 digits (membership) or 6 digits (DOB MMDDYY).",
-                ephemeral=True
+                "❌ Must be 4 digits (membership) or 6 digits (DOB MMDDYY).", ephemeral=True
             )
 
         todays = get_todays_rsvps()
-        # One RSVP per user
         if any(r["user_id"] == inter.user.id for r in todays):
             return await inter.response.send_message(
                 "❌ You’ve already RSVPed for tonight.", ephemeral=True
             )
-        # Membership numbers unique tonight
         if len(key)==4 and any(r["id_or_dob"] == key for r in todays):
             return await inter.response.send_message(
                 "❌ That membership # has already been used tonight.", ephemeral=True
@@ -92,11 +88,11 @@ class RSVPModal(ui.Modal, title="VIP RSVP"):
         )
         human = human_date(get_sale_date())
         entry = {
-            "user_id":    inter.user.id,
-            "name":       inter.user.display_name,
-            "last_name":  self.last_name.value.strip(),
-            "id_or_dob":  key,
-            "code":       code
+            "user_id":   inter.user.id,
+            "name":      inter.user.display_name,
+            "last_name": self.last_name.value.strip(),
+            "id_or_dob": key,
+            "code":      code
         }
         add_rsvp(entry)
 
@@ -123,13 +119,13 @@ class RSVPButtonView(ui.View):
         style=discord.ButtonStyle.primary,
         custom_id="vip_rsvp_button"
     )
-    async def rsvp_button(self, button: ui.Button, inter: Interaction):
-        if "VIP" not in [r.name for r in inter.user.roles]:
-            return await inter.response.send_message("⛔ VIPs only.", ephemeral=True)
-        await inter.response.send_modal(RSVPModal())
-        # disable button for this user by removing view for them:
+    async def rsvp_button(self, interaction: Interaction, button: ui.Button):
+        if "VIP" not in [r.name for r in interaction.user.roles]:
+            return await interaction.response.send_message("⛔ VIPs only.", ephemeral=True)
+        await interaction.response.send_modal(RSVPModal())
+        # disable button after click
         button.disabled = True
-        await inter.message.edit(view=self)
+        await interaction.message.edit(view=self)
 
 # ---------- STAFF COG ----------
 class StaffCommands(commands.Cog):
@@ -174,10 +170,10 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    # spin up health‐check
+    # start health‐check
     Thread(target=lambda: app.run(host="0.0.0.0", port=8080), daemon=True).start()
 
-    # register and post persistent button
+    # register views & post button
     view = RSVPButtonView()
     bot.add_view(view)
     ch = bot.get_channel(VIP_CHANNEL_ID)
@@ -188,7 +184,7 @@ async def on_ready():
         )
 
     # load staff cog & sync
-    bot.add_cog(StaffCommands(bot))
+    await bot.add_cog(StaffCommands(bot))
     await bot.tree.sync(guild=GUILD)
 
     print(f"✅ VIPBot ready as {bot.user}")
