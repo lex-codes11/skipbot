@@ -67,21 +67,30 @@ class RSVPModal(ui.Modal, title="VIP RSVP"):
 
     async def on_submit(self, inter: Interaction):
         key = self.id_or_dob.value.strip()
+        # 1) Must be digits, length 4 or 6
         if not (key.isdigit() and len(key) in (4,6)):
-            return await inter.response.send_message(
-                "❌ Must be 4 digits (membership) or 6 digits (DOB MMDDYY).", ephemeral=True
+            await inter.response.send_message(
+                "❌ Entry must be exactly 4 digits (membership #) or 6 digits (DOB MMDDYY).",
+                ephemeral=True
             )
+            return  # stop here
 
+        # 2) Prevent multiple RSVPs per user
         todays = get_todays_rsvps()
         if any(r["user_id"] == inter.user.id for r in todays):
-            return await inter.response.send_message(
+            await inter.response.send_message(
                 "❌ You’ve already RSVPed for tonight.", ephemeral=True
             )
+            return
+
+        # 3) Prevent reusing the same membership # (only 4‑digit keys)
         if len(key)==4 and any(r["id_or_dob"] == key for r in todays):
-            return await inter.response.send_message(
+            await inter.response.send_message(
                 "❌ That membership # has already been used tonight.", ephemeral=True
             )
+            return
 
+        # 4) All good → generate code, save & send ticket
         code = "-".join(
             "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=3))
             for _ in range(3)
@@ -120,10 +129,16 @@ class RSVPButtonView(ui.View):
         custom_id="vip_rsvp_button"
     )
     async def rsvp_button(self, interaction: Interaction, button: ui.Button):
+        # ensure VIP role
         if "VIP" not in [r.name for r in interaction.user.roles]:
-            return await interaction.response.send_message("⛔ VIPs only.", ephemeral=True)
+            return await interaction.response.send_message(
+                "⛔ VIPs only.", ephemeral=True
+            )
+
+        # open the modal
         await interaction.response.send_modal(RSVPModal())
-        # disable button after click
+
+        # disable the button so each member only uses it once
         button.disabled = True
         await interaction.message.edit(view=self)
 
@@ -138,9 +153,12 @@ class StaffCommands(commands.Cog):
     )
     @app_commands.guilds(GUILD)
     async def list_rsvps(self, inter: Interaction):
+        # only staff or owner
         if not (inter.user.guild_permissions.manage_guild or
                 "Staff" in [r.name for r in inter.user.roles]):
-            return await inter.response.send_message("⛔ Staff only.", ephemeral=True)
+            return await inter.response.send_message(
+                "⛔ Staff only.", ephemeral=True
+            )
 
         entries = get_todays_rsvps()
         if not entries:
@@ -170,20 +188,20 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    # start health‐check
+    # start health‑check server
     Thread(target=lambda: app.run(host="0.0.0.0", port=8080), daemon=True).start()
 
-    # register views & post button
+    # install the view and post the button
     view = RSVPButtonView()
     bot.add_view(view)
-    ch = bot.get_channel(VIP_CHANNEL_ID)
-    if ch:
-        await ch.send(
+    vip_ch = bot.get_channel(VIP_CHANNEL_ID)
+    if vip_ch:
+        await vip_ch.send(
             "🎉 **VIP RSVP for tonight**\nClick below to get your ticket:",
             view=view
         )
 
-    # load staff cog & sync
+    # add the staff cog and sync only to your guild
     await bot.add_cog(StaffCommands(bot))
     await bot.tree.sync(guild=GUILD)
 
