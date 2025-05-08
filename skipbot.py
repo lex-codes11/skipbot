@@ -1,23 +1,25 @@
 # skipbot.py
 
 import os, json, datetime, random
-import asyncio
 from threading import Thread
 from zoneinfo import ZoneInfo
 
 import discord
 from discord import ui, app_commands, Interaction, TextStyle
 from discord.ext import commands
-from flask import Flask, request, abort
+from flask import Flask
+import stripe
 
 # ---------- CONFIG ----------
 DATA_DIR        = os.getenv("DATA_DIR", "data")
 RSVP_FILE       = os.path.join(DATA_DIR, "vip_rsvps.json")
 DISCORD_TOKEN   = os.getenv("DISCORD_TOKEN")
 GUILD_ID        = int(os.getenv("GUILD_ID"))
-VIP_CHANNEL_ID  = int(os.getenv("VIP_CHANNEL_ID"))  # where the button lives
+VIP_CHANNEL_ID  = int(os.getenv("VIP_CHANNEL_ID"))
 
 GUILD           = discord.Object(id=GUILD_ID)
+
+stripe.api_key  = os.getenv("STRIPE_API_KEY")
 
 # ---------- STORAGE HELPERS ----------
 def ensure_data_dir():
@@ -37,8 +39,8 @@ def save_rsvps(data: dict):
 
 def add_rsvp(entry: dict):
     data = load_rsvps()
-    key = get_sale_date()
-    day = data.setdefault(key, [])
+    key  = get_sale_date()
+    day  = data.setdefault(key, [])
     day.append(entry)
     save_rsvps(data)
 
@@ -58,10 +60,9 @@ def human_date(iso: str) -> str:
 # ---------- RSVP MODAL ----------
 class RSVPModal(ui.Modal, title="VIP RSVP"):
     last_name = ui.TextInput(label="Last name on your ID", style=TextStyle.short)
-    id_or_dob = ui.TextInput(label="Club ID (4 digits) or DOB (MMDDYY)", style=TextStyle.short)
+    id_or_dob = ui.TextInput(label="Club ID or DOB (MMDDYY)", style=TextStyle.short)
 
     async def on_submit(self, inter: Interaction):
-        # generate 9‑char code with dashes: XXX-XXX-XXX
         code = "-".join(
             "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=3))
             for _ in range(3)
@@ -76,7 +77,6 @@ class RSVPModal(ui.Modal, title="VIP RSVP"):
         add_rsvp(entry)
 
         human = human_date(get_sale_date())
-        # Ack plus DM
         await inter.response.send_message("✅ RSVP received! Check your DMs for your ticket.", ephemeral=True)
         await inter.user.send(
             f"🎟 **VIP RSVP Ticket**\n"
@@ -91,15 +91,13 @@ class RSVPModal(ui.Modal, title="VIP RSVP"):
 class RSVPButtonView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(ui.Button(
-            label="Get my VIP ticket for tonight",
-            style=discord.ButtonStyle.primary,
-            custom_id="vip_rsvp_button"
-        ))
 
-    @ui.button(custom_id="vip_rsvp_button")
-    async def on_click(self, button: ui.Button, inter: Interaction):
-        # VIP role enforcement
+    @ui.button(
+        label="Get my VIP ticket for tonight",
+        style=discord.ButtonStyle.primary,
+        custom_id="vip_rsvp_button"
+    )
+    async def rsvp_button(self, button: ui.Button, inter: Interaction):
         if "VIP" not in [r.name for r in inter.user.roles]:
             return await inter.response.send_message("⛔ VIPs only.", ephemeral=True)
         await inter.response.send_modal(RSVPModal())
@@ -115,7 +113,6 @@ class StaffCommands(commands.Cog):
     )
     @app_commands.guilds(GUILD)
     async def list_rsvps(self, inter: Interaction):
-        # only staff or manage_guild
         if not (inter.user.guild_permissions.manage_guild or
                 "Staff" in [r.name for r in inter.user.roles]):
             return await inter.response.send_message("⛔ Staff only.", ephemeral=True)
@@ -135,9 +132,8 @@ class StaffCommands(commands.Cog):
         for chunk in [text[i:i+1900] for i in range(0, len(text), 1900)]:
             await inter.response.send_message(chunk, ephemeral=True)
 
-# ---------- FLASK HEALTH CHECK (optional) ----------
+# ---------- FLASK HEALTH CHECK ----------
 app = Flask(__name__)
-
 @app.route("/", methods=["GET","HEAD"])
 def health():
     return "OK", 200
@@ -149,19 +145,20 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    # start Flask (health) server
+    # start Flask thread
     Thread(target=lambda: app.run(host="0.0.0.0", port=8080), daemon=True).start()
 
-    # persistent button
-    bot.add_view(RSVPButtonView())
+    # register & post the persistent button
+    view = RSVPButtonView()
+    bot.add_view(view)
     vip_ch = bot.get_channel(VIP_CHANNEL_ID)
     if vip_ch:
         await vip_ch.send(
             "🎉 **VIP RSVP for tonight**\nClick below to get your ticket:",
-            view=RSVPButtonView()
+            view=view
         )
 
-    # register staff cog & slash commands scoped to your guild
+    # register staff cog & slash commands
     await bot.add_cog(StaffCommands(bot))
     await bot.tree.sync(guild=GUILD)
 
