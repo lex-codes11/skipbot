@@ -68,7 +68,6 @@ class RSVPModal(ui.Modal, title="VIP RSVP"):
 
     async def on_submit(self, inter: Interaction):
         key = self.id_or_dob.value.strip()
-        # 4 or 6 digits only
         if not (key.isdigit() and (len(key)==4 or len(key)==6)):
             return await inter.response.send_message(
                 "❌ Must be exactly 4 digits (membership #) or 6 digits (DOB MMDDYY).",
@@ -76,12 +75,10 @@ class RSVPModal(ui.Modal, title="VIP RSVP"):
             )
 
         todays = get_todays_rsvps()
-        # user can RSVP only once
         if any(r["user_id"] == inter.user.id for r in todays):
             return await inter.response.send_message(
                 "❌ You’ve already RSVPed for tonight.", ephemeral=True
             )
-        # block duplicate membership‐# only
         if len(key)==4 and any(r["id_or_dob"] == key for r in todays):
             return await inter.response.send_message(
                 "❌ That membership # has already been used tonight.", ephemeral=True
@@ -137,11 +134,10 @@ class StaffCommands(commands.Cog):
 
     @app_commands.command(
         name="list_rsvps",
-        description="(Staff) List tonight’s VIP RSVPs",
-        guild=GUILD
+        description="(Staff) List tonight’s VIP RSVPs"
     )
+    @app_commands.guilds(GUILD)
     async def list_rsvps(self, inter: Interaction):
-        # only Staff or owner
         if not (inter.user.guild_permissions.manage_guild or
                 "Staff" in [r.name for r in inter.user.roles]):
             return await inter.response.send_message("⛔ Staff only.", ephemeral=True)
@@ -177,15 +173,15 @@ async def on_ready():
     # start health‐check server
     Thread(target=lambda: app.run(host="0.0.0.0", port=8080), daemon=True).start()
 
-    # persistent RSVP button in VIP channel
+    # post persistent button
     view = RSVPButtonView()
     bot.add_view(view)
     ch = bot.get_channel(VIP_CHANNEL_ID)
     if ch:
         await ch.send("🎉 **VIP RSVP for tonight**\nClick below to get your ticket:", view=view)
 
-    # staff commands
-    await bot.add_cog(StaffCommands(bot))
+    # load staff cog and sync
+    bot.add_cog(StaffCommands(bot))
     await bot.tree.sync(guild=GUILD)
 
     print(f"✅ VIPBot ready as {bot.user}")
