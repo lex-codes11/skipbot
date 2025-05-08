@@ -1,23 +1,24 @@
 # skipbot.py
-import os, json, datetime, random
-from threading import Thread
-from zoneinfo import ZoneInfo
+import os, json, datetime, random, asyncio
+from threading    import Thread
+from zoneinfo     import ZoneInfo
 
 import discord
-from discord import ui, app_commands, Interaction, TextStyle
-from discord.ext import commands
-from flask import Flask
+from discord      import ui, app_commands, Interaction, TextStyle
+from discord.ext  import commands
+from flask        import Flask
 import stripe
 
 # ---------- CONFIG ----------
 DATA_DIR        = os.getenv("DATA_DIR", "data")
 RSVP_FILE       = os.path.join(DATA_DIR, "vip_rsvps.json")
 DISCORD_TOKEN   = os.getenv("DISCORD_TOKEN")
+STRIPE_API_KEY  = os.getenv("STRIPE_API_KEY")
 GUILD_ID        = int(os.getenv("GUILD_ID"))
 VIP_CHANNEL_ID  = int(os.getenv("VIP_CHANNEL_ID"))
 GUILD           = discord.Object(id=GUILD_ID)
 
-stripe.api_key  = os.getenv("STRIPE_API_KEY")
+stripe.api_key  = STRIPE_API_KEY
 
 # ---------- STORAGE HELPERS ----------
 def ensure_data_dir():
@@ -58,33 +59,58 @@ def human_date(iso: str) -> str:
 # ---------- RSVP MODAL ----------
 class RSVPModal(ui.Modal, title="VIP RSVP"):
     last_name = ui.TextInput(label="Last name on your ID", style=TextStyle.short)
-    id_or_dob = ui.TextInput(label="Club ID or DOB (MMDDYY)", style=TextStyle.short)
+    id_or_dob = ui.TextInput(
+        label="Membership Number (4 digits) or DOB (MMDDYY)",
+        style=TextStyle.short,
+        placeholder="e.g. 1234 or 010190"
+    )
 
     async def on_submit(self, inter: Interaction):
+        key = self.id_or_dob.value.strip()
+        # must be 4 or 6 digits
+        if not (key.isdigit() and (len(key)==4 or len(key)==6)):
+            return await inter.response.send_message(
+                "❌ Must be exactly 4 digits (membership #) or 6 digits (DOB MMDDYY).",
+                ephemeral=True
+            )
+
+        todays = get_todays_rsvps()
+        # block same user twice
+        if any(r["user_id"] == inter.user.id for r in todays):
+            return await inter.response.send_message(
+                "❌ You’ve already RSVPed for tonight.", ephemeral=True
+            )
+        # block re‑use only for 4‑digit membership #
+        if len(key)==4 and any(r["id_or_dob"] == key for r in todays):
+            return await inter.response.send_message(
+                "❌ That membership # has already been used tonight.", ephemeral=True
+            )
+
+        # generate ticket code
         code = "-".join(
-            "".join(random.choices(
-                "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=3))
+            "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=3))
             for _ in range(3)
         )
+        human = human_date(get_sale_date())
         entry = {
             "user_id":    inter.user.id,
             "name":       inter.user.display_name,
-            "last_name":  self.last_name.value,
-            "id_or_dob":  self.id_or_dob.value,
+            "last_name":  self.last_name.value.strip(),
+            "id_or_dob":  key,
             "code":       code
         }
         add_rsvp(entry)
 
-        human = human_date(get_sale_date())
+        # confirm & DM ticket
         await inter.response.send_message(
-            "✅ RSVP received! Check your DMs for your ticket.",
-            ephemeral=True
+            "✅ RSVP received! Check your DMs for your ticket.", ephemeral=True
         )
         await inter.user.send(
             f"🎟 **VIP RSVP Ticket**\n"
             f"Member: {inter.user.display_name}\n"
-            f"Last Name: {self.last_name.value}\n"
-            f"Club ID / DOB: {self.id_or_dob.value}\n"
+            f"Last Name: {self.last_name.value.strip()}\n"
+            f"Membership #: {key if len(key)==4 else '—'}\n"
+            f"DOB: {key if len(key)==6 else '—'}\n"
             f"Valid Date: {human}\n"
             f"Code: `{code}`"
         )
@@ -93,21 +119,21 @@ class RSVPModal(ui.Modal, title="VIP RSVP"):
 class RSVPButtonView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)
+        # one persistent button
+        self.add_item(ui.Button(
+            label="Get my VIP ticket for tonight",
+            style=discord.ButtonStyle.primary,
+            custom_id="vip_rsvp_button"
+        ))
 
-    @ui.button(
-        label="Get my VIP ticket for tonight",
-        style=discord.ButtonStyle.primary,
-        custom_id="vip_rsvp_button"
-    )
-    async def rsvp_button(self, interaction: Interaction, button: ui.Button):
-        # enforce VIP role
-        if "VIP" not in [r.name for r in interaction.user.roles]:
-            return await interaction.response.send_message(
-                "⛔ VIPs only.", ephemeral=True
-            )
-        await interaction.response.send_modal(RSVPModal())
+    @ui.button(custom_id="vip_rsvp_button", style=discord.ButtonStyle.primary)
+    async def rsvp_button(self, button: ui.Button, inter: Interaction):
+        # only VIPs
+        if "VIP" not in [r.name for r in inter.user.roles]:
+            return await inter.response.send_message("⛔ VIPs only.", ephemeral=True)
+        await inter.response.send_modal(RSVPModal())
 
-# ---------- STAFF COMMANDS ----------
+# ---------- STAFF COG ----------
 class StaffCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -116,25 +142,23 @@ class StaffCommands(commands.Cog):
         name="list_rsvps",
         description="(Staff) List tonight’s VIP RSVPs"
     )
+    @app_commands.checks.guild_only()
     @app_commands.guilds(GUILD)
     async def list_rsvps(self, inter: Interaction):
+        # only Staff role or guild owner
         if not (inter.user.guild_permissions.manage_guild or
                 "Staff" in [r.name for r in inter.user.roles]):
-            return await inter.response.send_message(
-                "⛔ Staff only.", ephemeral=True
-            )
+            return await inter.response.send_message("⛔ Staff only.", ephemeral=True)
 
         entries = get_todays_rsvps()
         if not entries:
-            return await inter.response.send_message(
-                "No RSVPs yet.", ephemeral=True
-            )
+            return await inter.response.send_message("No RSVPs yet.", ephemeral=True)
 
         lines = [f"**VIP RSVPs for {human_date(get_sale_date())}**"]
         for i,e in enumerate(entries, start=1):
             lines.append(
                 f"{i:2d}. {e['name']} — Last: {e['last_name']} "
-                f"— ID/DOB: {e['id_or_dob']} — Code: `{e['code']}`"
+                f"— Membership #: {e['id_or_dob']} — Code: `{e['code']}`"
             )
 
         text = "\n".join(lines)
@@ -145,7 +169,7 @@ class StaffCommands(commands.Cog):
 app = Flask(__name__)
 @app.route("/", methods=["GET","HEAD"])
 def health():
-    return "OK", 200
+    return "VIPBot OK", 200
 
 # ---------- BOT SETUP ----------
 intents = discord.Intents.default()
@@ -157,23 +181,23 @@ async def on_ready():
     # start health‐check server
     Thread(target=lambda: app.run(host="0.0.0.0", port=8080), daemon=True).start()
 
-    # register & post the persistent view
+    # register persistent view & post button
     view = RSVPButtonView()
     bot.add_view(view)
     vip_ch = bot.get_channel(VIP_CHANNEL_ID)
     if vip_ch:
+        # optionally delete old bot messages here…
         await vip_ch.send(
             "🎉 **VIP RSVP for tonight**\nClick below to get your ticket:",
             view=view
         )
 
-    # staff cog & slash command sync
+    # register staff commands
     await bot.add_cog(StaffCommands(bot))
     await bot.tree.sync(guild=GUILD)
 
-    print(f"✅ SkipBot ready as {bot.user}")
+    print(f"✅ VIPBot ready as {bot.user}")
 
-# ---------- RUN ----------
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN")
 bot.run(DISCORD_TOKEN)
