@@ -1,5 +1,7 @@
 # skipbot.py
-import os, json, datetime, random, asyncio
+
+import os, json, datetime, random
+import asyncio
 from threading import Thread
 from zoneinfo import ZoneInfo
 
@@ -7,77 +9,74 @@ import discord
 from discord import ui, app_commands, Interaction, TextStyle
 from discord.ext import commands
 from flask import Flask, request, abort
-import stripe
 
 # ---------- CONFIG ----------
 DATA_DIR        = os.getenv("DATA_DIR", "data")
 RSVP_FILE       = os.path.join(DATA_DIR, "vip_rsvps.json")
 DISCORD_TOKEN   = os.getenv("DISCORD_TOKEN")
-STRIPE_API_KEY  = os.getenv("STRIPE_API_KEY")
 GUILD_ID        = int(os.getenv("GUILD_ID"))
-VIP_CHANNEL_ID  = int(os.getenv("VIP_CHANNEL_ID"))  # channel where button lives
+VIP_CHANNEL_ID  = int(os.getenv("VIP_CHANNEL_ID"))  # where the button lives
 
-MAX_PER_NIGHT   = 25
 GUILD           = discord.Object(id=GUILD_ID)
-
-stripe.api_key = STRIPE_API_KEY
 
 # ---------- STORAGE HELPERS ----------
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
 
-def load_rsvps():
+def load_rsvps() -> dict:
     ensure_data_dir()
     if not os.path.exists(RSVP_FILE):
         return {}
     with open(RSVP_FILE, "r") as f:
         return json.load(f)
 
-def save_rsvps(data):
+def save_rsvps(data: dict):
     ensure_data_dir()
     with open(RSVP_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
-def add_rsvp(entry):
+def add_rsvp(entry: dict):
     data = load_rsvps()
-    today = datetime.datetime.now(ZoneInfo("America/New_York"))
-    if today.hour < 1:
-        today -= datetime.timedelta(days=1)
-    key = today.date().isoformat()
+    key = get_sale_date()
     day = data.setdefault(key, [])
     day.append(entry)
     save_rsvps(data)
 
-def get_todays_rsvps():
-    data = load_rsvps()
-    key = datetime.datetime.now(ZoneInfo("America/New_York")).date().isoformat()
-    return data.get(key, [])
+def get_todays_rsvps() -> list:
+    return load_rsvps().get(get_sale_date(), [])
 
-# ---------- TICKET MODAL ----------
+# ---------- DATE HELPERS ----------
+def get_sale_date() -> str:
+    now = datetime.datetime.now(ZoneInfo("America/New_York"))
+    if now.hour < 1:
+        now -= datetime.timedelta(days=1)
+    return now.date().isoformat()
+
+def human_date(iso: str) -> str:
+    return datetime.date.fromisoformat(iso).strftime("%A, %B %-d, %Y")
+
+# ---------- RSVP MODAL ----------
 class RSVPModal(ui.Modal, title="VIP RSVP"):
     last_name = ui.TextInput(label="Last name on your ID", style=TextStyle.short)
     id_or_dob = ui.TextInput(label="Club ID (4 digits) or DOB (MMDDYY)", style=TextStyle.short)
 
-    def __init__(self):
-        super().__init__()
-
     async def on_submit(self, inter: Interaction):
-        # generate code
+        # generate 9‑char code with dashes: XXX-XXX-XXX
         code = "-".join(
             "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=3))
             for _ in range(3)
         )
-        human = datetime.datetime.now(ZoneInfo("America/New_York")).strftime("%A, %B %-d, %Y")
         entry = {
-            "user_id":   inter.user.id,
-            "name":      inter.user.display_name,
-            "last_name": self.last_name.value,
-            "id_or_dob": self.id_or_dob.value,
-            "code":      code
+            "user_id":    inter.user.id,
+            "name":       inter.user.display_name,
+            "last_name":  self.last_name.value,
+            "id_or_dob":  self.id_or_dob.value,
+            "code":       code
         }
         add_rsvp(entry)
 
-        # ack and DM
+        human = human_date(get_sale_date())
+        # Ack plus DM
         await inter.response.send_message("✅ RSVP received! Check your DMs for your ticket.", ephemeral=True)
         await inter.user.send(
             f"🎟 **VIP RSVP Ticket**\n"
@@ -99,53 +98,74 @@ class RSVPButtonView(ui.View):
         ))
 
     @ui.button(custom_id="vip_rsvp_button")
-    async def rsvp_button(self, button: ui.Button, inter: Interaction):
-        # enforce VIP role
+    async def on_click(self, button: ui.Button, inter: Interaction):
+        # VIP role enforcement
         if "VIP" not in [r.name for r in inter.user.roles]:
             return await inter.response.send_message("⛔ VIPs only.", ephemeral=True)
         await inter.response.send_modal(RSVPModal())
 
-# ---------- STAFF LIST COMMAND ----------
+# ---------- STAFF COMMANDS ----------
 class StaffCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="list_rsvps", description="(Staff) List tonight’s VIP RSVPs", guild=GUILD)
+    @app_commands.command(
+        name="list_rsvps",
+        description="(Staff) List tonight’s VIP RSVPs"
+    )
+    @app_commands.guilds(GUILD)
     async def list_rsvps(self, inter: Interaction):
-        if not (inter.user.guild_permissions.manage_guild or "Staff" in [r.name for r in inter.user.roles]):
+        # only staff or manage_guild
+        if not (inter.user.guild_permissions.manage_guild or
+                "Staff" in [r.name for r in inter.user.roles]):
             return await inter.response.send_message("⛔ Staff only.", ephemeral=True)
+
         entries = get_todays_rsvps()
         if not entries:
             return await inter.response.send_message("No RSVPs yet.", ephemeral=True)
-        lines = ["**VIP RSVPs for tonight**"]
+
+        lines = [f"**VIP RSVPs for {human_date(get_sale_date())}**"]
         for i,e in enumerate(entries, start=1):
-            lines.append(f"{i:2d}. {e['name']} — Last: {e['last_name']} — ID/DOB: {e['id_or_dob']} — Code: `{e['code']}`")
+            lines.append(
+                f"{i:2d}. {e['name']} — Last: {e['last_name']} "
+                f"— ID/DOB: {e['id_or_dob']} — Code: `{e['code']}`"
+            )
+
         text = "\n".join(lines)
         for chunk in [text[i:i+1900] for i in range(0, len(text), 1900)]:
             await inter.response.send_message(chunk, ephemeral=True)
 
-# ---------- DISCORD BOT SETUP ----------
+# ---------- FLASK HEALTH CHECK (optional) ----------
+app = Flask(__name__)
+
+@app.route("/", methods=["GET","HEAD"])
+def health():
+    return "OK", 200
+
+# ---------- BOT SETUP ----------
 intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    # start Flask thread
-    Thread(target=lambda: Flask(__name__).run(host="0.0.0.0", port=8080), daemon=True).start()
+    # start Flask (health) server
+    Thread(target=lambda: app.run(host="0.0.0.0", port=8080), daemon=True).start()
 
-    # post or re-post the persistent button in VIP channel
+    # persistent button
     bot.add_view(RSVPButtonView())
-    ch = bot.get_channel(VIP_CHANNEL_ID)
-    if ch:
-        # you may want to delete any old bot messages first
-        await ch.send("🎉 **VIP RSVP for tonight**\nClick below to get your ticket:", view=RSVPButtonView())
+    vip_ch = bot.get_channel(VIP_CHANNEL_ID)
+    if vip_ch:
+        await vip_ch.send(
+            "🎉 **VIP RSVP for tonight**\nClick below to get your ticket:",
+            view=RSVPButtonView()
+        )
 
-    # register staff cog & commands
+    # register staff cog & slash commands scoped to your guild
+    await bot.add_cog(StaffCommands(bot))
     await bot.tree.sync(guild=GUILD)
-    bot.add_cog(StaffCommands(bot))
 
-    print(f"✅ SkipBot ready as {bot.user}")
+    print(f"✅ SkipBot ready as {bot.user} in guild {GUILD_ID}")
 
 # ---------- RUN ----------
 if not DISCORD_TOKEN:
