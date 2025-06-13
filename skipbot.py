@@ -60,7 +60,7 @@ def human_date(iso: str) -> str:
 class RSVPModal(ui.Modal, title="VIP RSVP"):
     last_name = ui.TextInput(label="Last name on your ID", style=TextStyle.short)
     id_or_dob = ui.TextInput(
-        label="Membership Number (4 digits) or DOB (MMDDYY)",
+        label="Membership Number (4 digits) or DOB (MMDDYY)",
         style=TextStyle.short,
         placeholder="e.g. 1234 or 010190"
     )
@@ -70,10 +70,10 @@ class RSVPModal(ui.Modal, title="VIP RSVP"):
         # 1) Must be digits, length 4 or 6
         if not (key.isdigit() and len(key) in (4,6)):
             await inter.response.send_message(
-                "❌ Entry must be exactly 4 digits (membership #) or 6 digits (DOB MMDDYY).",
+                "❌ Entry must be exactly 4 digits (membership #) or 6 digits (DOB MMDDYY).",
                 ephemeral=True
             )
-            return  # stop here
+            return
 
         # 2) Prevent multiple RSVPs per user
         todays = get_todays_rsvps()
@@ -83,10 +83,10 @@ class RSVPModal(ui.Modal, title="VIP RSVP"):
             )
             return
 
-        # 3) Prevent reusing the same membership # (only 4‑digit keys)
+        # 3) Prevent reusing the same membership # (only 4-digit keys)
         if len(key)==4 and any(r["id_or_dob"] == key for r in todays):
             await inter.response.send_message(
-                "❌ That membership # has already been used tonight.", ephemeral=True
+                "❌ That membership # has already been used tonight.", ephemeral=True
             )
             return
 
@@ -112,7 +112,7 @@ class RSVPModal(ui.Modal, title="VIP RSVP"):
             f"🎟 **VIP RSVP Ticket**\n"
             f"Member: {inter.user.display_name}\n"
             f"Last Name: {self.last_name.value.strip()}\n"
-            f"Membership #: {key if len(key)==4 else '—'}\n"
+            f"Membership #: {key if len(key)==4 else '—'}\n"
             f"DOB: {key if len(key)==6 else '—'}\n"
             f"Valid Date: {human}\n"
             f"Code: `{code}`"
@@ -138,7 +138,7 @@ class RSVPButtonView(ui.View):
         # open the modal
         await interaction.response.send_modal(RSVPModal())
 
-        # disable the button so each member only uses it once
+        # disable **this button instance** so the same user can't click it again
         button.disabled = True
         await interaction.message.edit(view=self)
 
@@ -168,7 +168,7 @@ class StaffCommands(commands.Cog):
         for i,e in enumerate(entries, start=1):
             lines.append(
                 f"{i:2d}. {e['name']} — Last: {e['last_name']} "
-                f"— Membership #: {e['id_or_dob']} — Code: `{e['code']}`"
+                f"— Membership #: {e['id_or_dob']} — Code: `{e['code']}`"
             )
 
         text = "\n".join(lines)
@@ -188,11 +188,11 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    # start health‑check server
+    # start health-check server
     Thread(target=lambda: app.run(host="0.0.0.0", port=8080), daemon=True).start()
 
     # install the view and post the button
-    view = RSVPButtonView()
+    view  = RSVPButtonView()
     bot.add_view(view)
     vip_ch = bot.get_channel(VIP_CHANNEL_ID)
     if vip_ch:
